@@ -8,9 +8,10 @@ drops, and a preview reconstructing the session from its transcript — what was
 asked, what the agent said back, the shell and edit work folded in between,
 then its last message and live screen.
 
-Meant to be bound to a key as a `type = "popup"` command in herdr's
-config.toml (see the README); also runnable from any shell inside a herdr
-session.
+Ships as a herdr plugin: `herdr-plugin.toml` declares it as a popup pane
+entrypoint and a key reaches that through the `open` action (see the README).
+It is still an ordinary script — runnable from any shell inside a herdr session,
+and bindable as a plain `type = "popup"` command.
 
   herdr-agents            focus an agent, or start one in a listed folder
   herdr-agents --list     print the rows (no fzf, nothing launched or focused)
@@ -26,6 +27,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,6 +39,11 @@ import time
 # an age. Claude reports a session id and stores <cwd-slug>/<id>.jsonl; pi
 # reports the transcript path outright.
 CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+
+# Running as a herdr plugin, the binary to call back into is the one herdr
+# points at rather than whatever "herdr" resolves to on PATH -- the plugin's
+# PATH is the server's, and a managed install need not have herdr on it at all.
+HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
 
 STATE_ICON = {
     "working": ("*", "\033[33m"),
@@ -59,7 +66,7 @@ def herdr_run(*args: str, timeout: float = 5):
     could not be run at all). Callers that need the failure reason want this;
     herdr() is the shorthand for the ones that do not."""
     try:
-        return subprocess.run(("herdr",) + args, capture_output=True, text=True,
+        return subprocess.run((HERDR_BIN,) + args, capture_output=True, text=True,
                               timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -887,7 +894,9 @@ def main(argv: list[str]) -> int:
          # It has to be `load`, not `start`: start fires before the input is
          # read and the move is lost — measured, it silently does nothing.
          "--bind=load:down",
-         "--preview", f"{self_path} --preview {{1}}",
+         # fzf runs the preview through a shell, and as a plugin this path is
+         # herdr's managed checkout rather than a path the user chose.
+         "--preview", f"{shlex.quote(self_path)} --preview {{1}}",
          f"--preview-window={preview_window()}"],
         input="\n".join(lines), capture_output=True, text=True)
     if picked.returncode != 0:

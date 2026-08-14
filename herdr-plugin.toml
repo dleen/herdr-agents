@@ -1,0 +1,29 @@
+id = "dleen.herdr-agents"
+name = "Agent picker"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "An fzf picker for every agent pane herdr knows about, worst-first, with a preview that reconstructs each session from its transcript."
+platforms = ["linux", "macos"]
+
+# The picker is fzf: it needs a terminal, so it is a pane entrypoint rather
+# than an action. `popup` keeps the tiled layout untouched and hands the picker
+# every key including esc. 90% is just short of full bleed -- the edges of the
+# panes behind it stay visible -- and wide enough for the side-by-side preview
+# split, which herdr-agents stacks underneath below 170 columns.
+[[panes]]
+id = "picker"
+title = "Agents"
+placement = "popup"
+width = "90%"
+height = "90%"
+command = ["python3", "herdr-agents"]
+
+# A key cannot bind a pane entrypoint directly -- `[[keys.command]]` speaks
+# `plugin_action` -- so this action is the one hop between the two. It is a
+# shell script only because argv arrays are not expanded and it needs
+# $HERDR_BIN_PATH.
+[[actions]]
+id = "open"
+title = "Open the agent picker"
+contexts = ["workspace"]
+command = ["sh", "open-picker.sh"]

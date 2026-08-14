@@ -3,7 +3,11 @@
 An fzf picker for every agent pane [herdr](https://herdr.dev) knows about —
 bound to a key, it opens as a popup, lists your agents worst-first, previews
 what each one has actually been doing, and starts new ones in folders that
-have nothing running.
+have nothing running. Installs as a herdr plugin:
+
+```sh
+herdr plugin install dleen/herdr-agents
+```
 
 ```
 agent> ▏
@@ -51,14 +55,65 @@ preview.
 
 ## Requirements
 
-- [herdr](https://herdr.dev) 0.8 or later, with agents configured
+- [herdr](https://herdr.dev) 0.8 or later, with agents configured — 0.8 is what
+  the manifest asks for, since popup pane entrypoints and `plugin pane open`
+  arrived there
 - [fzf](https://github.com/junegunn/fzf) (0.74+ tested)
-- Python 3.10+ (no third-party packages)
+- Python 3.10+ (no third-party packages) — as `python3` on the herdr *server's*
+  `PATH`, which is what the manifest launches
 - optional: [zoxide](https://github.com/ajeetdsouza/zoxide), for folder suggestions
 
 ## Install
 
-Clone somewhere permanent and symlink the script onto your `PATH`:
+It is a [herdr plugin](https://herdr.dev/docs/plugins/), so herdr can fetch it
+itself — no clone, no symlink, nothing on your `PATH`:
+
+```sh
+herdr plugin install dleen/herdr-agents
+```
+
+That clones the repo into herdr-managed plugin data, shows you the manifest and
+the commands it will run, and registers it globally for every session. There is
+no build step: the picker is Python with no third-party packages, so
+`[[build]]` is absent from the manifest and install is just the checkout.
+
+Check it before wiring up a key:
+
+```sh
+herdr plugin list --plugin dleen.herdr-agents
+herdr plugin action list --plugin dleen.herdr-agents
+```
+
+### Bind it to a key
+
+Add to `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "plugin_action"
+command = "dleen.herdr-agents.open"
+description = "pick an agent"
+```
+
+Then `herdr config check` and `herdr server reload-config` (`prefix+shift+r`).
+No restart needed.
+
+The popup and its 90% dimensions live in `herdr-plugin.toml` rather than in the
+keybinding, so the key is the same three lines however the picker is sized. A
+key binds an *action*, not a pane entrypoint, which is the one hop
+`open-picker.sh` exists for: the action asks herdr to open the `picker` pane,
+and the manifest says how.
+
+> **Nothing happens on `prefix+a`?** Unlike a `type = "popup"` command, a
+> plugin action leaves a record — `herdr plugin log list --plugin
+> dleen.herdr-agents` has the exit status and output of every invocation.
+
+### Or as a standalone script
+
+The picker predates the plugin manifest and still runs as a plain script, which
+is worth keeping for `--list` from any shell. Clone somewhere permanent and
+symlink it onto your `PATH`:
 
 ```sh
 git clone https://github.com/dleen/herdr-agents.git ~/code/herdr-agents
@@ -72,15 +127,8 @@ from beside the *real* script, so it can never go stale against the script that
 imports it. If it is missing, launching still works — you just get a one-line
 "starting…" print instead of an animation.
 
-Check it before wiring up a key:
-
-```sh
-herdr-agents --list      # print the rows; works outside a herdr session too
-```
-
-### Bind it to a key
-
-Add to `~/.config/herdr/config.toml`:
+Bound as a popup command instead of a plugin action, it wants the dimensions in
+the keybinding:
 
 ```toml
 [[keys.command]]
@@ -95,12 +143,23 @@ width = "90%"
 height = "90%"
 ```
 
-Then `herdr config check` and `herdr server reload-config` (`prefix+shift+r`).
-No restart needed.
-
 > **A popup whose command is not on `PATH` fails silently.** If `prefix+a`
 > appears to do nothing, check that `~/.local/bin` is on the `PATH` herdr's
-> server inherits, and that the symlink resolves.
+> server inherits, and that the symlink resolves. This is the failure the
+> plugin install does not have.
+
+### Hacking on it
+
+Link the working tree rather than installing from GitHub, and herdr runs your
+edits in place:
+
+```sh
+herdr plugin link ~/code/herdr-agents
+herdr plugin unlink dleen.herdr-agents
+```
+
+Installing over a linked plugin is refused, so unlink before switching back to
+`plugin install`.
 
 ### Optional: collapse herdr's own agents sidebar
 
@@ -121,6 +180,23 @@ sidebar_collapsed_mode = "compact"
 | `herdr-agents --list` | print the rows; launches and focuses nothing, works anywhere |
 | `herdr-agents --preview <pane_id\|§folder>` | render one entry — this is what fzf calls back |
 | `herdr-agents --splash [card] [seconds]` | play the launch title cards and exit |
+
+Installed as a plugin there is no `herdr-agents` on your `PATH`, and the
+equivalents go through herdr:
+
+| | |
+|---|---|
+| `herdr plugin action invoke dleen.herdr-agents.open` | the picker, same as the key |
+| `herdr plugin pane open --plugin dleen.herdr-agents --entrypoint picker` | the picker, skipping the action |
+| `herdr plugin log list --plugin dleen.herdr-agents` | what each invocation did |
+
+The managed checkout is a normal directory, so `--list`, `--preview`, and
+`--splash` are still there if you want them:
+
+```sh
+root=$(herdr plugin list --plugin dleen.herdr-agents --json | jq -r '.result.plugins[0].plugin_root')
+python3 "$root/herdr-agents" --list
+```
 
 Inside the picker: <kbd>enter</kbd> focus (or start, on a folder),
 <kbd>ctrl-a</kbd> choose the agent kind, <kbd>esc</kbd> cancel.
@@ -163,3 +239,9 @@ Things that were measured the hard way and are worth not rediscovering:
   ends the card on whichever comes first.
 - Agent names must match `[a-z][a-z0-9_-]{0,31}`, which a folder basename like
   `Inbox` is not — `agent_name_base()` slugs it.
+- A plugin action is not a terminal. Actions run detached with their output
+  going to the plugin log, so fzf cannot live in one; the picker has to be a
+  `[[panes]]` entrypoint, and the action is only what a key can name.
+- A plugin's `PATH` is the herdr *server's*, not your shell's, and a managed
+  install need not put herdr on it at all. Hence `HERDR_BIN_PATH` for every
+  callback rather than a bare `herdr`.
