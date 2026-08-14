@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""An fzf picker for every agent pane herdr knows about.
+
+Herdr's own agents panel is a ~30-column sidebar rail, and it only lists panes
+whose agent state it managed to detect. This is the wider view: one row per
+pane that has an agent session, state resolved even for the panes the sidebar
+drops, and a preview reconstructing the session from its transcript — what was
+asked, what the agent said back, the shell and edit work folded in between,
+then its last message and live screen.
+
+Meant to be bound to a key as a `type = "popup"` command in herdr's
+config.toml (see the README); also runnable from any shell inside a herdr
+session.
+
+  herdr-agents            focus an agent, or start one in a listed folder
+  herdr-agents --list     print the rows (no fzf, nothing launched or focused)
+  herdr-agents --preview <pane_id|§folder>  render one entry (used by fzf)
+  herdr-agents --splash [card] [seconds]    play the launch title cards and exit
+"""
+
+from __future__ import annotations
+
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+# Panes are matched to a transcript so the picker can show a last message and
+# an age. Claude reports a session id and stores <cwd-slug>/<id>.jsonl; pi
+# reports the transcript path outright.
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+
+STATE_ICON = {
+    "working": ("*", "\033[33m"),
+    "blocked": ("!", "\033[31m"),
+    "idle": ("o", "\033[32m"),
+    "done": ("o", "\033[32m"),
+    "unknown": ("-", "\033[90m"),
+}
+STATE_TEXT = {"blocked": "needs input", "done": "done", "idle": "idle",
+              "working": "working", "unknown": "?"}
+RESET = "\033[0m"
+DIM = "\033[90m"
+
+# Folder headers are ordinary fzf entries wearing a sentinel key.
+HEADER_KEY = "\u00a7"
+
+
+def herdr_run(*args: str, timeout: float = 5):
+    """Run a herdr CLI command, returning the CompletedProcess (None if it
+    could not be run at all). Callers that need the failure reason want this;
+    herdr() is the shorthand for the ones that do not."""
+    try:
+        return subprocess.run(("herdr",) + args, capture_output=True, text=True,
+                              timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def herdr(*args: str, timeout: float = 5) -> str:
+    """Run a herdr CLI command, returning stdout ('' on any failure)."""
+    out = herdr_run(*args, timeout=timeout)
+    if out is None:
+        return ""
+    return out.stdout if out.returncode == 0 else ""
+
+
+def error_code(stderr: str) -> str:
+    """The error code from a failed herdr call. Server errors are JSON on
+    stderr; a syntax error (exit 2) is plain text and has none."""
+    try:
+        return (json.loads(stderr).get("error") or {}).get("code") or ""
+    except (ValueError, AttributeError):
+        return ""
+
+
+def herdr_json(*args: str) -> dict:
+    try:
+        return json.loads(herdr(*args)).get("result", {})
+    except (ValueError, AttributeError):
+        return {}
+
+
+def resolve_state(pane: dict) -> str:
+    """Herdr's state for a pane, or the one its own rules give the screen.
+
+    A pane herdr never bound to a detected agent process keeps agent_status
+    "unknown" forever, even while the agent is plainly sitting on a prompt.
+    The content rules still work on it, so ask them directly.
+    """
+    state = pane.get("agent_status") or "unknown"
+    if state != "unknown":
+        return state
+    agent = (pane.get("agent_session") or {}).get("agent")
+    if not agent:
+        return state
+    screen = herdr("pane", "read", pane["pane_id"], "--source", "detection",
+                   "--lines", "80", "--format", "text")
+    if not screen.strip():
+        return state
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        fh.write(screen)
+        path = fh.name
+    try:
+        for line in herdr("agent", "explain", "--file", path,
+                          "--agent", agent).splitlines():
+            if line.startswith("state:"):
+                return line.split(":", 1)[1].strip()
+    finally:
+        os.unlink(path)
+    return state
+
+
+def transcript_path(pane: dict) -> str | None:
+    session = pane.get("agent_session") or {}
+    if session.get("kind") == "path":
+        return session.get("value")
+    if session.get("kind") == "id" and session.get("value"):
+        slug = (pane.get("cwd") or "").replace("/", "-")
+        candidate = os.path.join(CLAUDE_PROJECTS, slug, session["value"] + ".jsonl")
+        if os.path.exists(candidate):
+            return candidate
+        # The slug is not a plain "/" → "-" swap for every cwd (spaces and dots
+        # are rewritten too), so fall back to finding the id under any project.
+        found = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session["value"] + ".jsonl"))
+        return found[0] if found else None
+    return None
+
+
+def flat(text: str, limit: int = 400) -> str:
+    return " ".join(str(text).split())[:limit]
+
+
+def tool_label(name: str, args: dict) -> str:
+    """One line describing a tool call, in the terms the user thinks in."""
+    args = args if isinstance(args, dict) else {}
+    low = (name or "").lower()
+    if low.startswith("mcp__"):
+        parts = name.split("__")
+        return f"{parts[1]}: {parts[-1]}" if len(parts) > 2 else name
+    if low == "bash":
+        return flat(args.get("description") or args.get("command") or "bash")
+    if low in ("read", "edit", "write", "notebookedit", "multiedit"):
+        target = args.get("file_path") or args.get("path") or args.get("notebook_path") or ""
+        return f"{low} {os.path.basename(target) or target}"
+    if low in ("grep", "glob"):
+        return f"{low} {flat(args.get('pattern') or args.get('query') or '')}"
+    if low in ("task", "agent"):
+        kind = args.get("subagent_type") or args.get("model") or "agent"
+        return f"agent[{kind}] {flat(args.get('description') or '')}"
+    if low == "todowrite":
+        for todo in args.get("todos") or []:
+            if isinstance(todo, dict) and todo.get("status") == "in_progress":
+                return "todo " + flat(todo.get("activeForm") or todo.get("content") or "")
+        return "todo list updated"
+    if low == "skill":
+        return f"skill {args.get('skill') or ''}".strip()
+    if low == "webfetch":
+        return f"fetch {flat(args.get('url') or '')}"
+    if low == "websearch":
+        return f"search {flat(args.get('query') or '')}"
+    if low == "workflow":
+        return f"workflow {flat(args.get('name') or 'inline script')}"
+    first = next((str(v) for v in args.values() if isinstance(v, (str, int))), "")
+    return f"{name} {flat(first, 80)}".strip()
+
+
+def stamp(value) -> float:
+    """Transcript timestamps are UTC ISO; return epoch seconds (0 if absent)."""
+    if not value:
+        return 0.0
+    try:
+        return time.mktime(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+    except ValueError:
+        return 0.0
+
+
+def read_session(path: str | None, tail_bytes: int = 12_000_000) -> dict:
+    """Parse a Claude or pi transcript into a common activity summary.
+
+    Returns events (chronological), counters, and the last assistant message.
+    Only the tail is read, so a very long session reports partial counts —
+    flagged with `truncated` rather than quietly under-reported.
+    """
+    out = {"events": [], "prompts": 0, "tools": 0, "tokens": 0, "commits": 0,
+           "files": [], "errors": 0, "last": "", "model": "", "title": "",
+           "started": 0.0, "truncated": False}
+    if not path or not os.path.exists(path):
+        return out
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+                fh.readline()  # drop the partial line the seek landed inside
+                out["truncated"] = True
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return out
+
+    seen_usage, files = set(), []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("isSidechain") or rec.get("isMeta"):
+            continue
+        when = stamp(rec.get("timestamp"))
+        if when and not out["started"]:
+            out["started"] = when
+        kind = rec.get("type")
+        if kind == "ai-title" and rec.get("aiTitle"):
+            out["title"] = flat(rec["aiTitle"], 120)
+            continue
+        # pi wraps everything in {"type": "message", "message": {...}}; Claude
+        # puts the role in the record type. Normalise to (role, content).
+        message = rec.get("message")
+        if kind == "message" and isinstance(message, dict):
+            role = message.get("role")
+        elif kind in ("user", "assistant") and isinstance(message, dict):
+            role = kind
+        else:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list):
+            continue
+
+        if role == "assistant":
+            usage = message.get("usage") or {}
+            key = (message.get("id"), rec.get("requestId"))
+            billed = (usage.get("cache_read_input_tokens", 0)
+                      or usage.get("cache_creation_input_tokens", 0))
+            if billed and key not in seen_usage:  # an API error carries zeros
+                seen_usage.add(key)
+                out["tokens"] += (usage.get("input_tokens", 0) + billed
+                                  + usage.get("output_tokens", 0))
+            if message.get("model"):
+                out["model"] = message["model"]
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text" and block.get("text", "").strip():
+                text = flat(block["text"], 2000)
+                if role == "assistant":
+                    out["events"].append((when, "say", text, ""))
+                    out["last"] = text
+                elif role == "user":
+                    out["prompts"] += 1
+                    out["events"].append((when, "prompt", text, ""))
+            elif btype in ("tool_use", "toolCall"):
+                name = block.get("name", "")
+                args = block.get("input") or block.get("arguments") or {}
+                out["tools"] += 1
+                out["events"].append((when, "tool", tool_label(name, args), name.lower()))
+                if name.lower() in ("edit", "write", "multiedit", "notebookedit"):
+                    target = args.get("file_path") or args.get("path") or ""
+                    if target and target not in files:
+                        files.append(target)
+                if name.lower() == "bash" and "git commit" in str(args.get("command", "")):
+                    out["commits"] += 1
+            elif btype == "tool_result" and block.get("is_error"):
+                out["errors"] += 1
+    out["files"] = files
+    return out
+
+
+def age(path: str | None) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    delta = time.time() - os.path.getmtime(path)
+    if delta < 90:
+        return f"{int(delta)}s"
+    if delta < 5400:
+        return f"{int(delta / 60)}m"
+    if delta < 172_800:
+        return f"{int(delta / 3600)}h"
+    return f"{int(delta / 86400)}d"
+
+
+def collect() -> list[dict]:
+    panes = herdr_json("pane", "list").get("panes") or []
+    spaces = {w["workspace_id"]: w
+              for w in herdr_json("workspace", "list").get("workspaces") or []}
+    rows = []
+    for pane in panes:
+        agent = (pane.get("agent_session") or {}).get("agent") or pane.get("agent")
+        if not agent:
+            continue
+        space = spaces.get(pane.get("workspace_id"), {})
+        path = transcript_path(pane)
+        rows.append({
+            "pane_id": pane["pane_id"],
+            "workspace_id": pane.get("workspace_id", ""),
+            "tab_id": pane.get("tab_id", ""),
+            "agent": agent,
+            "state": resolve_state(pane),
+            "number": space.get("number", 0),
+            "label": space.get("label", pane.get("workspace_id", "")),
+            "focused": pane.get("focused") or space.get("focused") or False,
+            "title": pane.get("terminal_title_stripped") or "",
+            "cwd": pane.get("cwd") or "",
+            "transcript": path,
+            "age": age(path),
+        })
+    # Anything wanting a human first, then the busy ones, then the rest.
+    rows.sort(key=lambda r: (URGENCY.get(r["state"], 4), r["number"]))
+    return rows
+
+
+# Groups are keyed on the full cwd, not the workspace label: two worktrees of
+# the same repo both show up as "settings" but are different work.
+URGENCY = {"blocked": 0, "working": 1, "idle": 2, "done": 2, "unknown": 3}
+
+
+def group_by_folder(rows: list[dict], extra: int = 12) -> list[tuple[str, object]]:
+    """Rows bucketed by cwd, each bucket led by a folder entry.
+
+    Buckets are ordered by their most urgent agent so a folder with something
+    waiting on a human still floats to the top. Folders with nothing running
+    follow, so the same list answers both "go to an agent" and "start one
+    somewhere else".
+    """
+    folders: dict[str, list[dict]] = {}
+    for row in rows:
+        folders.setdefault(row["cwd"] or "?", []).append(row)
+    ordered = sorted(folders.items(),
+                     key=lambda kv: (min(URGENCY.get(r["state"], 4) for r in kv[1]),
+                                     kv[0]))
+    out: list[tuple[str, object]] = []
+    for folder, members in ordered:
+        out.append(("header", folder))
+        out.extend(("row", r) for r in
+                   sorted(members, key=lambda r: (URGENCY.get(r["state"], 4),
+                                                  r["number"])))
+    for folder in recent_folders(limit=len(folders) + extra):
+        if folder not in folders:
+            out.append(("header", folder))
+    return out
+
+
+def render_header(folder: str, count: int, color: bool = True) -> str:
+    path = folder.replace(os.path.expanduser("~"), "~")
+    head, _, base = path.rpartition("/")
+    # A folder with agents is labelled by how many; one without is labelled by
+    # what enter would start there, since starting is the only thing it offers.
+    tally = f"({count})" if count else f"+ {default_kind(folder)}"
+    if not color:
+        return f"{path}  {tally}"
+    return f"{DIM}{head}/{RESET}\033[1m{base}{RESET}{DIM}  {tally}{RESET}"
+
+
+def render(row: dict, color: bool = True) -> str:
+    icon, hue = STATE_ICON.get(row["state"], STATE_ICON["unknown"])
+    on, off, dim = (hue, RESET, DIM) if color else ("", "", "")
+    state = STATE_TEXT.get(row["state"], row["state"])
+    head = f"  {on}{icon}{off} {row['number']:>1}  {state:<11} {row['age']:>4}"
+    return f"{head}  {dim}{row['agent']:<6} {row['title'][:70]}{off}"
+
+
+CYAN = "\033[36m"
+
+# Tool calls are grouped into the run between two things a human said, because
+# a bare list of 114 bash lines is not "what happened" — it is noise with
+# timestamps. Each verb collapses differently: shell work and edits are named,
+# lookups are only counted.
+TOOL_GROUP = {
+    "bash": "run", "edit": "edit", "write": "edit", "multiedit": "edit",
+    "notebookedit": "edit", "read": "look", "grep": "look", "glob": "look",
+}
+
+
+def collapse(events: list, width: int) -> list:
+    """Turn a flat event list into conversation lines with tool runs folded in."""
+    lines, run = [], []
+
+    def flush():
+        if not run:
+            return
+        named, edits, looks, notable = [], [], 0, []
+        for name, label in run:
+            group = TOOL_GROUP.get(name)
+            if group == "edit":
+                target = label.split(" ", 1)[-1]
+                if target not in edits:
+                    edits.append(target)
+            elif group == "look":
+                looks += 1
+            elif group == "run":
+                named.append(label)  # a bash call is its description
+            else:
+                notable.append(label)  # agent, skill, an MCP tool: name it
+        if named:
+            extra = f" (+{len(named) - 3})" if len(named) > 3 else ""
+            lines.append(("", "$", DIM, " · ".join(named[:3]) + extra))
+        if edits:
+            lines.append(("", "✎", DIM, ", ".join(edits[:5])))
+        if looks:
+            lines.append(("", "⋯", DIM, f"{looks} lookup{'s' if looks > 1 else ''}"))
+        for label in notable[:3]:
+            lines.append(("", "⚙", DIM, label))
+        run.clear()
+
+    for when, kind, text, name in events:
+        clock = time.strftime("%H:%M", time.localtime(when)) if when else ""
+        if kind == "tool":
+            run.append((name, text))
+            continue
+        flush()
+        mark, hue = ("▸", CYAN) if kind == "prompt" else ("⤷", "")
+        lines.append((clock, mark, hue, text))
+    flush()
+    cap = max(20, width - 9)
+    return [(c, m, h, t if len(t) <= cap else t[: cap - 1] + "…")
+            for c, m, h, t in lines]
+
+
+def tokens_short(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M tok"
+    if count >= 1000:
+        return f"{count // 1000}k tok"
+    return f"{count} tok" if count else ""
+
+
+def duration(seconds: float) -> str:
+    if seconds <= 0:
+        return ""
+    hours, minutes = int(seconds // 3600), int(seconds % 3600 // 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
+
+
+def preview_folder(folder: str) -> int:
+    """A folder entry: what runs here now, and what enter would start."""
+    members = [r for r in collect() if r["cwd"] == folder]
+    print(render_header(folder, len(members)))
+    try:
+        git = subprocess.run(["git", "-C", folder, "status", "--porcelain", "-b"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        git = None
+    if git is not None and git.returncode == 0:
+        lines = git.stdout.splitlines()
+        dirty = len(lines) - 1
+        print(f"{DIM}{lines[0][3:] if lines else ''}  ·  "
+              f"{dirty} change{'s' if dirty != 1 else ''}{RESET}")
+
+    info = load_state().get("folders", {}).get(folder) or {}
+    started = (f"{info['count']}× from here, last {info['kind']} "
+               f"{age_of(info['last'])} ago" if info.get("last") else
+               "never started from here")
+    print(f"\n{DIM}enter{RESET} start {default_kind(folder)}   "
+          f"{DIM}ctrl-a{RESET} choose agent\n{DIM}{started}{RESET}")
+
+    if members:
+        print(f"\n{DIM}running here{RESET}")
+        for row in members:
+            print(render(row))
+    return 0
+
+
+def preview_window() -> str:
+    """Where to put the preview, in absolute cells.
+
+    fzf's own conditional form (`right,55%,<160(down,60%)`) picks the
+    alternative at any width in 0.74 — measured — so the split is decided here
+    instead. Narrow popups get a full-width preview underneath, because the
+    activity timeline and last message are prose and 40 columns shreds them.
+    """
+    cols, lines = shutil.get_terminal_size((120, 40))
+    if cols >= 170:
+        return f"right,{cols // 2},wrap"
+    return f"down,{max(14, lines * 3 // 5)},wrap,border-top"
+
+
+def preview(pane_id: str, events_shown: int = 16) -> int:
+    if pane_id.startswith(HEADER_KEY):
+        return preview_folder(pane_id[len(HEADER_KEY):])
+    row = next((r for r in collect() if r["pane_id"] == pane_id), None)
+    if row is None:
+        print("pane is gone")
+        return 0
+    width = int(os.environ.get("FZF_PREVIEW_COLUMNS") or 78)
+    session = read_session(row["transcript"])
+
+    print(f"\033[1m{row['label']}\033[0m  {row['agent']}  "
+          f"{STATE_TEXT.get(row['state'], row['state'])}"
+          f"{'  ' + row['age'] + ' ago' if row['age'] else ''}")
+    model = (session["model"] or "").replace("claude-", "")
+    meta = [row["cwd"].replace(os.path.expanduser("~"), "~"), row["pane_id"], model]
+    print(f"{DIM}{'  ·  '.join(m for m in meta if m)}{RESET}")
+
+    title = session["title"] or row["title"]
+    if title:
+        print(f"\n{title}")
+
+    # What the session has cost in effort, not dollars: pricing a transcript by
+    # hand is its own trap -- rates move, cache reads are not cache writes --
+    # and turn and tool counts answer "what happened here" better anyway.
+    stats = [f"{session['prompts']} prompts", f"{session['tools']} tools"]
+    if session["commits"]:
+        stats.append(f"{session['commits']} commits")
+    if session["errors"]:
+        stats.append(f"{session['errors']} tool errors")
+    span = duration(time.time() - session["started"]) if session["started"] else ""
+    if span:
+        stats.append(span)
+    if session["tokens"]:
+        stats.append(tokens_short(session["tokens"]))
+    if session["prompts"] or session["tools"]:
+        lead = "…" if session["truncated"] else ""
+        print(f"\n{DIM}{lead}{'  ·  '.join(stats)}{RESET}")
+
+    lines = collapse(session["events"], width)
+    if lines:
+        shown = lines[-events_shown:]
+        # A window of pure agent output loses the thread. If the last thing the
+        # user asked scrolled off, put it back at the top of the window.
+        if not any(mark == "▸" for _, mark, _, _ in shown):
+            last_ask = next((ln for ln in reversed(lines) if ln[1] == "▸"), None)
+            if last_ask:
+                shown = [last_ask] + shown[1:]
+        print(f"\n{DIM}activity{RESET}")
+        for clock, mark, hue, text in shown:
+            stamped = f"{DIM}{clock:<5}{RESET}"
+            print(f"{stamped} {hue}{mark} {text}{RESET if hue else ''}")
+
+    if session["files"]:
+        shown = [os.path.basename(f) for f in session["files"][-8:]]
+        print(f"\n{DIM}files touched{RESET}\n{', '.join(shown)}")
+
+    if session["last"]:
+        print(f"\n{DIM}last message{RESET}\n{session['last'][:600]}")
+
+    screen = herdr("pane", "read", row["pane_id"], "--source", "recent",
+                   "--lines", "30", "--format", "text")
+    if screen.strip():
+        print(f"\n{DIM}screen{RESET}")
+        print(screen.rstrip())
+    return 0
+
+
+def focus(row: dict) -> int:
+    """Focus a pane. agent focus only accepts panes herdr detected as agents,
+    so fall back to walking workspace then tab."""
+    if herdr("agent", "focus", row["pane_id"]).strip():
+        return 0
+    herdr("workspace", "focus", row["workspace_id"])
+    if row["tab_id"]:
+        herdr("tab", "focus", row["tab_id"])
+    return 0
+
+
+# ---------------------------------------------------------------- launching
+
+STATE_FILE = os.path.expanduser("~/.local/state/herdr-agents/launches.json")
+AGENT_KINDS = ("claude", "codex", "pi")
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as fh:
+            json.dump(state, fh, indent=1)
+    except OSError:
+        pass  # a lost preference is not worth failing a launch over
+
+
+def recent_folders(limit: int = 40) -> list[str]:
+    """Folders worth launching in, best first.
+
+    Own launch history, then anywhere herdr already has a pane, then zoxide's
+    frecency list — three sources because none alone covers a fresh machine,
+    a folder you only ever open here, and a folder you only ever cd to.
+    """
+    state = load_state()
+    ordered = [f for f, _ in sorted(state.get("folders", {}).items(),
+                                    key=lambda kv: -kv[1].get("last", 0))]
+    ordered += [p.get("cwd") for p in herdr_json("pane", "list").get("panes") or []]
+    if shutil.which("zoxide"):
+        try:
+            zoxide = subprocess.run(["zoxide", "query", "-l"], capture_output=True,
+                                    text=True, timeout=3)
+            ordered += zoxide.stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    out, seen = [], set()
+    for folder in ordered:
+        folder = (folder or "").rstrip("/")
+        if not folder or folder in seen or not os.path.isdir(folder):
+            continue
+        seen.add(folder)
+        out.append(folder)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def kinds_available() -> list[str]:
+    """Installed agents, the last one launched first."""
+    last = load_state().get("last_kind")
+    found = [k for k in AGENT_KINDS if shutil.which(k)]
+    if last in found:
+        found.remove(last)
+        found.insert(0, last)
+    return found or list(AGENT_KINDS)
+
+
+def default_kind(folder: str) -> str:
+    state = load_state()
+    per_folder = (state.get("folders", {}).get(folder) or {}).get("kind")
+    return per_folder or (kinds_available() or ["claude"])[0]
+
+
+def age_of(when: float) -> str:
+    delta = max(0.0, time.time() - when)
+    if delta < 5400:
+        return f"{int(delta / 60)}m"
+    if delta < 172_800:
+        return f"{int(delta / 3600)}h"
+    return f"{int(delta / 86400)}d"
+
+
+def pick(lines: list[str], prompt: str, header: str,
+         preview_cmd: str | None) -> tuple[str, str]:
+    """Run fzf over plain lines, returning (key pressed, selected line)."""
+    args = ["fzf", "--ansi", "--layout=reverse", "--info=inline", "--pointer=>",
+            f"--prompt={prompt}", f"--header={header}"]
+    if preview_cmd:
+        args += ["--preview", preview_cmd, f"--preview-window={preview_window()}"]
+    done = subprocess.run(args, input="\n".join(lines), capture_output=True, text=True)
+    if done.returncode != 0:
+        return ("", "")
+    out = done.stdout.splitlines()
+    return ("", out[0] if out else "")
+
+
+def agent_name_base(label: str, kind: str) -> str:
+    """A herdr-legal agent name for `kind` running in `label`.
+
+    Agent names are `[a-z][a-z0-9_-]{0,31}`, and a folder basename is not one:
+    ~/notes/Inbox gives "Inbox-pi", which agent start rejects instantly
+    with invalid_agent_name — the same answer on every retry, so the launch
+    just spun and left the workspace at a shell. Capitalised, spaced, and
+    dotted folder names all landed there.
+
+    Truncated to 29 so unique_agent_name's "-<n>" suffix stays inside 32.
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "-", f"{label}-{kind}".lower()).strip("-_")
+    if not slug[:1].isalpha():
+        slug = f"a-{slug}".rstrip("-_")
+    return slug[:29].rstrip("-_") or "agent"
+
+
+def unique_agent_name(base: str) -> str:
+    name, suffix = base, 1
+    while herdr("agent", "get", name).strip():
+        suffix += 1
+        name = f"{base}-{suffix}"
+    return name
+
+
+# ------------------------------------------------------------------- splash
+# The title cards that fill the wait live next door, in herdr_splash.py: five of
+# them, several hundred lines of geometry, and none of it about picking an agent.
+#
+# It needs no symlink of its own. __file__ here is the link in ~/.local/bin, so
+# resolving it lands on the real script in its checkout and the module is
+# sitting beside it. If it is missing -- someone copied this file rather than
+# linking it -- launching still works, it just prints a line like it used to.
+
+
+def load_splash():
+    """herdr_splash, or None. Imported by path, since this script is a symlink."""
+    beside = os.path.join(os.path.dirname(os.path.realpath(__file__)), "herdr_splash.py")
+    try:
+        loader = importlib.machinery.SourceFileLoader("herdr_splash", beside)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def next_card(splash, state: dict) -> str:
+    """The card after the one the last launch used.
+
+    Rotating beats choosing at random: four cards seen in order are four cards
+    seen, where a coin would show the same one three times and hide another for
+    a fortnight. The index is kept alongside the folder history, so it survives
+    a restart and is one integer to reset.
+    """
+    index = int(state.get("splash", -1)) + 1
+    state["splash"] = index
+    return splash.CARD_NAMES[index % len(splash.CARD_NAMES)]
+
+
+def start_agent(name: str, kind: str, pane_id: str) -> tuple[str, str]:
+    """Start `kind` in `pane_id`. Returns (agent start's stdout, failure reason).
+
+    A pane created a moment ago is still starting its shell, and agent start
+    rejects it outright with agent_pane_busy rather than waiting — its own
+    --timeout only covers agent readiness, not shell readiness. So retry, on a
+    backoff that starts well inside a shell's startup rather than at a flat
+    750ms: when the first attempt loses that race the second is worth making
+    almost immediately, and the old constant spent most of its wait after the
+    pane was already good.
+    """
+    why = "herdr agent start could not be run"
+    for attempt in range(12):
+        done = herdr_run("agent", "start", name, "--kind", kind, "--pane", pane_id,
+                         "--timeout", "60000", timeout=90)
+        if done is None:
+            return "", why
+        if done.returncode == 0 and done.stdout.strip():
+            return done.stdout, ""
+        why = error_code(done.stderr) or f"agent start exited {done.returncode}"
+        # Only a pane still finishing its shell changes its mind on a retry.
+        # A bad name, a missing pane or an unknown kind will not, and spending
+        # nine seconds proving it just hides the reason.
+        if why != "agent_pane_busy":
+            break
+        time.sleep(min(0.75, 0.1 * 2 ** attempt))
+    return "", why
+
+
+# ------------------------------------------------------------------ readiness
+# `herdr agent start` does not return when the agent is ready. It returns on a
+# fixed interactive-readiness wait: measured at 3.04s ± 0.01 across runs in
+# herdr 0.8.0, unchanged when the agent is deliberately slowed by three seconds,
+# so it is a constant and not a measurement of anything. pi is at its prompt in
+# about 0.7s. Tying the card to that call therefore held it on a finished agent
+# for the last ~2.3 seconds, which is the whole of the "why is it still up"
+# complaint -- the wait it was covering had already ended.
+#
+# The agent's own lifecycle hook is the earlier and truthful signal. herdr's pi,
+# claude and codex integrations call pane.report_agent_session as their TUI
+# comes up, so `agent_session` appearing on the pane means the agent booted far
+# enough to introduce itself by name. Watch for that and end the card there.
+#
+# It is only ever an *early* exit: an agent with no integration installed never
+# reports one, `ready` never fires, and the card runs to `agent start` exactly
+# as before. Abandoning the call is safe -- the server binds the name up front,
+# and a `herdr agent start` killed mid-wait still leaves a named, running agent
+# (verified with SIGHUP at 1.3s).
+
+#: How often the pane is asked whether the agent has introduced itself.
+READY_POLL_S = 0.15
+#: Grace after an early exit for `agent start` to finish on its own, so the
+#: common case still reaps its own thread rather than orphaning the CLI.
+READY_JOIN_S = 0.3
+
+
+def watch_ready(pane_id: str, ready: threading.Event, running) -> None:
+    """Set `ready` once the pane's agent reports a session of its own."""
+    while running() and not ready.is_set():
+        pane = herdr_json("pane", "get", pane_id).get("pane") or {}
+        if (pane.get("agent_session") or {}).get("agent"):
+            ready.set()
+            return
+        time.sleep(READY_POLL_S)
+
+
+def launch(folder: str, kind: str) -> int:
+    label = os.path.basename(folder) or folder
+    created = herdr_json("workspace", "create", "--cwd", folder,
+                         "--label", label, "--focus")
+    pane_id = (created.get("root_pane") or {}).get("pane_id")
+    if not pane_id:
+        herdr("notification", "show", "herdr-agents",
+              "--body", f"could not create a workspace in {folder}")
+        return 1
+    name = unique_agent_name(agent_name_base(label, kind))
+    outcome: dict = {}
+
+    def work() -> None:
+        outcome["started"], outcome["why"] = start_agent(name, kind, pane_id)
+
+    # agent start goes on a thread and the animation is what this one does while
+    # it waits, so the title card costs the launch nothing but its 220ms flash.
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    ready = threading.Event()
+    threading.Thread(target=watch_ready, args=(pane_id, ready, worker.is_alive),
+                     daemon=True).start()
+    waiting = lambda: worker.is_alive() and not ready.is_set()  # noqa: E731
+    state = load_state()
+    splash = load_splash()
+    if splash and splash.wanted():
+        splash.play(kind, label, waiting, name=next_card(splash, state))
+    else:
+        print(f"{DIM}starting {kind} in {label}…{RESET}")
+        while waiting():
+            time.sleep(READY_POLL_S)
+    # Only the card may end early; the popup must not linger past it, so once the
+    # agent has said it is up the call gets a grace period and then the process
+    # leaves. `ready` is proof of a successful start on its own.
+    worker.join(READY_JOIN_S if ready.is_set() else None)
+    started = outcome.get("started", "") or ("ready" if ready.is_set() else "")
+    why = outcome.get("why") or "herdr agent start could not be run"
+    folders = state.setdefault("folders", {})
+    entry = folders.setdefault(folder, {"count": 0})
+    entry.update(count=entry.get("count", 0) + 1, last=time.time(), kind=kind)
+    state["last_kind"] = kind
+    save_state(state)
+    if not started.strip():
+        # The workspace is real and sitting at a shell either way, so leave it
+        # rather than tearing down a pane the user can just type into.
+        herdr("notification", "show", f"{kind} did not come up",
+              "--body", f"{label}: {why} — shell is waiting in the new workspace")
+        print(f"herdr-agents: agent start failed ({why})", file=sys.stderr)
+        return 1
+    return 0
+
+
+def choose_kind(folder: str) -> str:
+    """The second step of ctrl-a: which agent to start here."""
+    _, picked = pick(kinds_available(),
+                     prompt=f"agent for {os.path.basename(folder)}> ",
+                     header="enter start · esc cancel", preview_cmd=None)
+    return picked.strip()
+
+
+def main(argv: list[str]) -> int:
+    # --splash and --list answer without touching herdr, so they work anywhere.
+    if argv[:1] == ["--splash"]:
+        splash = load_splash()
+        if not splash:
+            print("herdr-agents: herdr_splash.py is not beside this script", file=sys.stderr)
+            return 1
+        return splash.main(argv[1:])
+    if os.environ.get("HERDR_ENV") != "1" and "--list" not in argv:
+        print("herdr-agents: not inside a herdr session", file=sys.stderr)
+        return 1
+    if len(argv) >= 2 and argv[0] == "--preview":
+        return preview(argv[1])
+
+    rows = collect()
+    entries = group_by_folder(rows)
+    counts = {folder: sum(1 for k, r in entries if k == "row" and r["cwd"] == folder)
+              for k, folder in entries if k == "header"}
+    if "--list" in argv:
+        color = sys.stdout.isatty()
+        for kind, item in entries:
+            print(render_header(item, counts[item], color) if kind == "header"
+                  else render(item, color))
+        return 0
+    if not shutil.which("fzf"):
+        print("herdr-agents: fzf is not installed", file=sys.stderr)
+        return 1
+
+    # One list, two verbs. An agent row focuses that agent; a folder row starts
+    # a new agent there — which is why folders with nothing running are in the
+    # list at all. The HEADER_KEY sentinel is what tells the two apart.
+    lines = [f"{HEADER_KEY}{item}\t{render_header(item, counts[item])}" if kind == "header"
+             else f"{item['pane_id']}\t{render(item)}"
+             for kind, item in entries]
+    self_path = os.path.abspath(__file__)
+    picked = subprocess.run(
+        ["fzf", "--ansi", "--with-nth=2..", "--delimiter=\t",
+         "--layout=reverse", "--info=inline", "--pointer=>",
+         "--prompt=agent> ",
+         "--header=enter focus · on a folder start an agent · ctrl-a choose · esc cancel",
+         "--expect=ctrl-a",
+         # Land on an agent, so a reflex enter focuses rather than launching.
+         # It has to be `load`, not `start`: start fires before the input is
+         # read and the move is lost — measured, it silently does nothing.
+         "--bind=load:down",
+         "--preview", f"{self_path} --preview {{1}}",
+         f"--preview-window={preview_window()}"],
+        input="\n".join(lines), capture_output=True, text=True)
+    if picked.returncode != 0:
+        return 0
+    out = picked.stdout.splitlines()
+    key, choice = (out[0] if out else ""), (out[1] if len(out) > 1 else "")
+    if not choice:
+        return 0
+
+    target = choice.split("\t", 1)[0].strip()
+    folder = target[len(HEADER_KEY):] if target.startswith(HEADER_KEY) else ""
+    row = next((r for r in rows if r["pane_id"] == target), None)
+    if key == "ctrl-a":
+        # ctrl-a on an agent row means "another one alongside this", so it
+        # launches in that agent's folder rather than focusing it.
+        folder = folder or (row or {}).get("cwd", "")
+        kind = choose_kind(folder) if folder else ""
+        return launch(folder, kind) if kind else 0
+    if folder:
+        return launch(folder, default_kind(folder))
+    return focus(row) if row else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
