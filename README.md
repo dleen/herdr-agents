@@ -47,6 +47,18 @@ preview.
 - **<kbd>ctrl-a</kbd>** picks which agent kind to start (`claude`, `codex`,
   `pi` — whichever herdr has configured). On an agent row it means "another one
   alongside this", so it launches in that agent's folder.
+- **<kbd>ctrl-x</kbd> forgets a folder**, reloading the list without it. Two of
+  the three suggestion sources are not ours to prune — zoxide ranks `/tmp`
+  because something once `cd`'d there — so the dismissal is recorded in the
+  state file and applied as a filter to all three. A folder with an agent still
+  running in it is refused, with a notification saying so; starting an agent
+  somewhere later un-forgets it, as does
+  `herdr-agents --unhide [folder]`.
+- **Searching a folder keeps its agents.** With `--with-nth`, fzf matches a line
+  against what it *displays*, so there is no hidden search field to put a cwd
+  in and a query naming a folder used to filter out the very agents running in
+  it. Each agent row therefore ends in the same path string its header shows —
+  last on the line, where a narrow list clips it.
 - **Title cards while it launches.** Starting an agent takes a couple of
   seconds; `herdr agent start` runs on a thread and the animation is what the
   main thread does while it waits, so it costs the launch nothing. Four cards
@@ -199,12 +211,14 @@ python3 "$root/herdr-agents" --list
 ```
 
 Inside the picker: <kbd>enter</kbd> focus (or start, on a folder),
-<kbd>ctrl-a</kbd> choose the agent kind, <kbd>esc</kbd> cancel.
+<kbd>ctrl-a</kbd> choose the agent kind, <kbd>ctrl-x</kbd> forget the folder
+under the cursor, <kbd>esc</kbd> cancel.
 
 Per-folder launch history lives in
 `~/.local/state/herdr-agents/launches.json` — how many agents you have started
-where, which kind was last, and the splash rotation index. Delete it to start
-over.
+where, which kind was last, the folders <kbd>ctrl-x</kbd> has dismissed, and the
+splash rotation index. Delete it to start over, or put one folder back with
+`herdr-agents --unhide <folder>` (no argument clears every dismissal).
 
 ## The splash
 

@@ -16,6 +16,9 @@ and bindable as a plain `type = "popup"` command.
   herdr-agents            focus an agent, or start one in a listed folder
   herdr-agents --list     print the rows (no fzf, nothing launched or focused)
   herdr-agents --preview <pane_id|§folder>  render one entry (used by fzf)
+  herdr-agents --lines    print the picker's fzf input (used by its reload)
+  herdr-agents --hide <§folder|folder>      drop a folder from the launch list
+  herdr-agents --unhide [folder]            put it back (no argument: all)
   herdr-agents --splash [card] [seconds]    play the launch title cards and exit
 """
 
@@ -358,8 +361,12 @@ def group_by_folder(rows: list[dict], extra: int = 12) -> list[tuple[str, object
     return out
 
 
+def short_path(folder: str) -> str:
+    return (folder or "").replace(os.path.expanduser("~"), "~")
+
+
 def render_header(folder: str, count: int, color: bool = True) -> str:
-    path = folder.replace(os.path.expanduser("~"), "~")
+    path = short_path(folder)
     head, _, base = path.rpartition("/")
     # A folder with agents is labelled by how many; one without is labelled by
     # what enter would start there, since starting is the only thing it offers.
@@ -369,12 +376,23 @@ def render_header(folder: str, count: int, color: bool = True) -> str:
     return f"{DIM}{head}/{RESET}\033[1m{base}{RESET}{DIM}  {tally}{RESET}"
 
 
-def render(row: dict, color: bool = True) -> str:
+def render(row: dict, color: bool = True, folder: bool = False) -> str:
+    """One agent row, optionally ending in its folder.
+
+    The folder is redundant under its own header and is only for fzf: with
+    --with-nth, fzf matches a line against what it *displays*, so a hidden
+    search field is not available and a query naming a folder would filter out
+    the very agents running in it. Carrying the same path string the header
+    shows keeps a group whole under any query that matches either half. Last on
+    the line is where it costs least — in a narrow list it is clipped, and fzf
+    scrolls the row along only when the match is out there.
+    """
     icon, hue = STATE_ICON.get(row["state"], STATE_ICON["unknown"])
     on, off, dim = (hue, RESET, DIM) if color else ("", "", "")
     state = STATE_TEXT.get(row["state"], row["state"])
     head = f"  {on}{icon}{off} {row['number']:>1}  {state:<11} {row['age']:>4}"
-    return f"{head}  {dim}{row['agent']:<6} {row['title'][:70]}{off}"
+    tail = f"  {short_path(row['cwd'])}" if folder and row.get("cwd") else ""
+    return f"{head}  {dim}{row['agent']:<6} {row['title'][:70]}{tail}{off}"
 
 
 CYAN = "\033[36m"
@@ -469,7 +487,8 @@ def preview_folder(folder: str) -> int:
                f"{age_of(info['last'])} ago" if info.get("last") else
                "never started from here")
     print(f"\n{DIM}enter{RESET} start {default_kind(folder)}   "
-          f"{DIM}ctrl-a{RESET} choose agent\n{DIM}{started}{RESET}")
+          f"{DIM}ctrl-a{RESET} choose agent   "
+          f"{DIM}ctrl-x{RESET} forget this folder\n{DIM}{started}{RESET}")
 
     if members:
         print(f"\n{DIM}running here{RESET}")
@@ -593,12 +612,71 @@ def save_state(state: dict) -> None:
         pass  # a lost preference is not worth failing a launch over
 
 
+def hidden_folders(state: dict | None = None) -> set[str]:
+    state = load_state() if state is None else state
+    return {str(f).rstrip("/") for f in state.get("hidden") or []}
+
+
+#: Enough dismissals to cover a machine's worth of junk paths without letting a
+#: held-down key grow the state file unboundedly.
+HIDDEN_CAP = 200
+
+
+def hide_folder(folder: str) -> int:
+    """Drop a folder from the suggestion list for good.
+
+    Two of the three sources are not ours to prune — zoxide ranks /tmp because
+    something cd'd there, and herdr lists a pane because it exists — so the
+    dismissal is recorded here and applied as a filter. The folder's own launch
+    history goes with it: this is "remove this entry", not "rank it lower".
+
+    A folder with an agent running in it is refused. Its header is built from
+    that agent's row rather than from the suggestion list, so it would stay on
+    screen and the keypress would look broken.
+    """
+    folder = (folder or "").rstrip("/")
+    if not folder:
+        return 0
+    live = {(p.get("cwd") or "").rstrip("/")
+            for p in herdr_json("pane", "list").get("panes") or []
+            if (p.get("agent_session") or {}).get("agent") or p.get("agent")}
+    if folder in live:
+        herdr("notification", "show", "herdr-agents",
+              "--body", f"{os.path.basename(folder) or folder} still has an agent "
+                        "running — close it first")
+        return 1
+    state = load_state()
+    hidden = [f for f in state.get("hidden") or [] if str(f).rstrip("/") != folder]
+    hidden.append(folder)
+    state["hidden"] = hidden[-HIDDEN_CAP:]
+    state.get("folders", {}).pop(folder, None)
+    save_state(state)
+    return 0
+
+
+def unhide_folder(folder: str | None) -> int:
+    """Undo a dismissal (or all of them, with no folder given)."""
+    state = load_state()
+    before = hidden_folders(state)
+    if folder:
+        target = folder.rstrip("/")
+        state["hidden"] = [f for f in state.get("hidden") or []
+                           if str(f).rstrip("/") != target]
+    else:
+        state["hidden"] = []
+    save_state(state)
+    freed = len(before) - len(hidden_folders(state))
+    print(f"herdr-agents: {freed} folder{'' if freed == 1 else 's'} unhidden")
+    return 0
+
+
 def recent_folders(limit: int = 40) -> list[str]:
     """Folders worth launching in, best first.
 
     Own launch history, then anywhere herdr already has a pane, then zoxide's
     frecency list — three sources because none alone covers a fresh machine,
     a folder you only ever open here, and a folder you only ever cd to.
+    Anything dismissed with ctrl-x is filtered out of all three.
     """
     state = load_state()
     ordered = [f for f, _ in sorted(state.get("folders", {}).items(),
@@ -611,7 +689,7 @@ def recent_folders(limit: int = 40) -> list[str]:
             ordered += zoxide.stdout.splitlines()
         except (OSError, subprocess.SubprocessError):
             pass
-    out, seen = [], set()
+    out, seen = [], hidden_folders(state)
     for folder in ordered:
         folder = (folder or "").rstrip("/")
         if not folder or folder in seen or not os.path.isdir(folder):
@@ -829,6 +907,9 @@ def launch(folder: str, kind: str) -> int:
     folders = state.setdefault("folders", {})
     entry = folders.setdefault(folder, {"count": 0})
     entry.update(count=entry.get("count", 0) + 1, last=time.time(), kind=kind)
+    # Deliberately starting an agent somewhere outranks an old dismissal.
+    state["hidden"] = [f for f in state.get("hidden") or []
+                       if str(f).rstrip("/") != folder.rstrip("/")]
     state["last_kind"] = kind
     save_state(state)
     if not started.strip():
@@ -849,6 +930,26 @@ def choose_kind(folder: str) -> str:
     return picked.strip()
 
 
+def picker_entries() -> tuple[list[dict], list[tuple[str, object]], dict[str, int]]:
+    rows = collect()
+    entries = group_by_folder(rows)
+    counts = {folder: sum(1 for k, r in entries if k == "row" and r["cwd"] == folder)
+              for k, folder in entries if k == "header"}
+    return rows, entries, counts
+
+
+def picker_lines(entries: list[tuple[str, object]], counts: dict[str, int]) -> list[str]:
+    """fzf input: a hidden key field, then the rendered line.
+
+    One list, two verbs. An agent row focuses that agent; a folder row starts a
+    new agent there — which is why folders with nothing running are in the list
+    at all. The HEADER_KEY sentinel is what tells the two apart.
+    """
+    return [f"{HEADER_KEY}{item}\t{render_header(item, counts[item])}"
+            if kind == "header" else f"{item['pane_id']}\t{render(item, folder=True)}"
+            for kind, item in entries]
+
+
 def main(argv: list[str]) -> int:
     # --splash and --list answer without touching herdr, so they work anywhere.
     if argv[:1] == ["--splash"]:
@@ -857,46 +958,56 @@ def main(argv: list[str]) -> int:
             print("herdr-agents: herdr_splash.py is not beside this script", file=sys.stderr)
             return 1
         return splash.main(argv[1:])
+    if argv[:1] == ["--unhide"]:
+        return unhide_folder(argv[1] if len(argv) > 1 else None)
     if os.environ.get("HERDR_ENV") != "1" and "--list" not in argv:
         print("herdr-agents: not inside a herdr session", file=sys.stderr)
         return 1
     if len(argv) >= 2 and argv[0] == "--preview":
         return preview(argv[1])
+    if len(argv) >= 2 and argv[0] == "--hide":
+        # Only a folder entry can be forgotten; ctrl-x on an agent row hands us
+        # its pane id, which is not a place and is left alone.
+        target = argv[1]
+        return hide_folder(target[len(HEADER_KEY):]
+                           if target.startswith(HEADER_KEY) else "")
 
-    rows = collect()
-    entries = group_by_folder(rows)
-    counts = {folder: sum(1 for k, r in entries if k == "row" and r["cwd"] == folder)
-              for k, folder in entries if k == "header"}
+    rows, entries, counts = picker_entries()
     if "--list" in argv:
         color = sys.stdout.isatty()
         for kind, item in entries:
             print(render_header(item, counts[item], color) if kind == "header"
                   else render(item, color))
         return 0
+    lines = picker_lines(entries, counts)
+    if "--lines" in argv:  # what ctrl-x's reload re-reads
+        print("\n".join(lines))
+        return 0
     if not shutil.which("fzf"):
         print("herdr-agents: fzf is not installed", file=sys.stderr)
         return 1
 
-    # One list, two verbs. An agent row focuses that agent; a folder row starts
-    # a new agent there — which is why folders with nothing running are in the
-    # list at all. The HEADER_KEY sentinel is what tells the two apart.
-    lines = [f"{HEADER_KEY}{item}\t{render_header(item, counts[item])}" if kind == "header"
-             else f"{item['pane_id']}\t{render(item)}"
-             for kind, item in entries]
-    self_path = os.path.abspath(__file__)
+    # fzf runs these through a shell, and as a plugin this path is herdr's
+    # managed checkout rather than a path the user chose.
+    me = shlex.quote(os.path.abspath(__file__))
     picked = subprocess.run(
         ["fzf", "--ansi", "--with-nth=2..", "--delimiter=\t",
          "--layout=reverse", "--info=inline", "--pointer=>",
          "--prompt=agent> ",
-         "--header=enter focus · on a folder start an agent · ctrl-a choose · esc cancel",
+         "--header=enter focus or start · ctrl-a choose agent · "
+         "ctrl-x forget folder · esc cancel",
          "--expect=ctrl-a",
          # Land on an agent, so a reflex enter focuses rather than launching.
          # It has to be `load`, not `start`: start fires before the input is
          # read and the move is lost — measured, it silently does nothing.
-         "--bind=load:down",
-         # fzf runs the preview through a shell, and as a plugin this path is
-         # herdr's managed checkout rather than a path the user chose.
-         "--preview", f"{shlex.quote(self_path)} --preview {{1}}",
+         # Unbound straight after, or every ctrl-x reload would nudge the
+         # cursor down again on top of the row the list just lost.
+         "--bind=load:down+unbind(load)",
+         # Forget a folder without leaving the picker: the suggestion list is
+         # mostly zoxide's frecency, so it silts up with /tmp and one-off
+         # checkouts, and a dismissal is only worth making if it costs one key.
+         f"--bind=ctrl-x:execute-silent({me} --hide {{1}})+reload({me} --lines)",
+         "--preview", f"{me} --preview {{1}}",
          f"--preview-window={preview_window()}"],
         input="\n".join(lines), capture_output=True, text=True)
     if picked.returncode != 0:
