@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -305,6 +306,106 @@ class CodexBranchActivationTests(unittest.TestCase):
             self.SESSION_ID,
             timeout=90,
         )
+
+
+class CodexBranchDismissalTests(unittest.TestCase):
+    SESSION_ID = "01a01c11-eb5c-7c91-ad43-ac31378debbd"
+
+    def test_archive_uses_exact_codex_argv_and_succeeds(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with (
+            mock.patch.object(AGENTS, "CODEX_BIN", "codex-test"),
+            mock.patch.object(AGENTS, "codex_writer_active", return_value=False),
+            mock.patch.object(AGENTS.subprocess, "run", return_value=completed) as run,
+        ):
+            result = AGENTS.archive_codex_branch(self.SESSION_ID)
+
+        self.assertEqual(result, 0)
+        run.assert_called_once_with(
+            ("codex-test", "archive", self.SESSION_ID),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_active_writer_refuses_without_starting_codex(self):
+        with (
+            mock.patch.object(AGENTS, "codex_writer_active", return_value=True),
+            mock.patch.object(AGENTS, "codex_run") as run,
+            mock.patch.object(AGENTS, "herdr") as notify,
+        ):
+            result = AGENTS.archive_codex_branch(self.SESSION_ID)
+
+        self.assertEqual(result, 1)
+        run.assert_not_called()
+        self.assertEqual(
+            notify.call_args.args[:3],
+            ("notification", "show", "Codex branch is active"),
+        )
+        self.assertIn("/archive", notify.call_args.args[-1])
+        self.assertIn("external owner", notify.call_args.args[-1])
+
+    def test_archive_failure_notifies_for_nonzero_and_missing_process(self):
+        outcomes = (
+            subprocess.CompletedProcess([], 2, stdout="", stderr="permission denied"),
+            None,
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                with (
+                    mock.patch.object(AGENTS, "codex_writer_active", return_value=False),
+                    mock.patch.object(AGENTS, "codex_run", return_value=outcome),
+                    mock.patch.object(AGENTS, "herdr") as notify,
+                ):
+                    result = AGENTS.archive_codex_branch(self.SESSION_ID)
+
+                self.assertEqual(result, 1)
+                self.assertEqual(
+                    notify.call_args.args[:3],
+                    ("notification", "show", "Could not archive Codex branch"),
+                )
+                self.assertIn(self.SESSION_ID, notify.call_args.args[-1])
+
+    def test_dismiss_dispatches_folder_saved_branch_and_ignores_live_keys(self):
+        header = AGENTS.HEADER_KEY + "/repo"
+        saved = AGENTS.CODEX_KEY + self.SESSION_ID
+        with (
+            mock.patch.object(AGENTS, "hide_folder", return_value=0) as hide,
+            mock.patch.object(AGENTS, "archive_codex_branch", return_value=0) as archive,
+        ):
+            self.assertEqual(AGENTS.dismiss(header), 0)
+            hide.assert_called_once_with("/repo")
+            archive.assert_not_called()
+
+            hide.reset_mock()
+            self.assertEqual(AGENTS.dismiss(saved), 0)
+            archive.assert_called_once_with(self.SESSION_ID)
+            hide.assert_not_called()
+
+            archive.reset_mock()
+            self.assertEqual(AGENTS.dismiss("w1:p1"), 0)
+            self.assertEqual(AGENTS.dismiss(AGENTS.CODEX_KEY + "not-a-uuid"), 0)
+            hide.assert_not_called()
+            archive.assert_not_called()
+
+    def test_fzf_ctrl_x_dismisses_selected_key_then_reloads(self):
+        completed = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        with (
+            mock.patch.dict(os.environ, {"HERDR_ENV": "1"}),
+            mock.patch.object(AGENTS, "picker_entries", return_value=([], [], {})),
+            mock.patch.object(AGENTS.shutil, "which", return_value="/usr/bin/fzf"),
+            mock.patch.object(AGENTS.subprocess, "run", return_value=completed) as run,
+        ):
+            result = AGENTS.main([])
+
+        self.assertEqual(result, 0)
+        args = run.call_args.args[0]
+        binding = next(arg for arg in args if arg.startswith("--bind=ctrl-x:"))
+        self.assertIn("--dismiss {1}", binding)
+        self.assertIn("+reload(", binding)
+        header = next(arg for arg in args if arg.startswith("--header="))
+        self.assertIn("archive saved branch", header)
 
 
 if __name__ == "__main__":

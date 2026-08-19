@@ -1,6 +1,6 @@
 id = "dleen.herdr-agents"
 name = "Agent picker"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.8.0"
 description = "An fzf picker for live agent panes and Codex fork branches, with owner-safe switching and transcript previews."
 platforms = ["linux", "macos"]

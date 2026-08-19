@@ -82,13 +82,19 @@ preview.
 - **<kbd>ctrl-a</kbd>** picks which agent kind to start (`claude`, `codex`,
   `pi` — whichever herdr has configured). On an agent row it means "another one
   alongside this", so it launches in that agent's folder.
-- **<kbd>ctrl-x</kbd> forgets a folder**, reloading the list without it. Two of
-  the three suggestion sources are not ours to prune — zoxide ranks `/tmp`
-  because something once `cd`'d there — so the dismissal is recorded in the
-  state file and applied as a filter to all three. A folder with an agent still
+- **<kbd>ctrl-x</kbd> forgets a folder or archives a dormant saved Codex branch**,
+  reloading the list without the dismissed entry. Two of the three folder
+  suggestion sources are not ours to prune — zoxide ranks `/tmp` because
+  something once `cd`'d there — so folder dismissal is recorded in the state
+  file and applied as a filter to all three. A folder with an agent still
   running in it is refused, with a notification saying so; starting an agent
-  somewhere later un-forgets it, as does
-  `herdr-agents --unhide [folder]`.
+  somewhere later un-forgets it, as does `herdr-agents --unhide [folder]`.
+  For a saved Codex branch, ctrl-x calls `codex archive <id>` only after
+  confirming that no writer is active. The rollout transcript is preserved and
+  restorable with `codex unarchive <id>`; an active branch is refused with a
+  notification telling you to open it and use `/archive` in its TUI (or archive
+  it in the external owner). See
+  [Codex CLI session archival](https://developers.openai.com/codex/cli/reference/#codex-archive-and-codex-unarchive).
 - **Searching a folder keeps its agents.** With `--with-nth`, fzf matches a line
   against what it *displays*, so there is no hidden search field to put a cwd
   in and a query naming a folder used to filter out the very agents running in
@@ -108,6 +114,9 @@ preview.
 - [fzf](https://github.com/junegunn/fzf) (0.74+ tested)
 - Python 3.10+ (no third-party packages) — as `python3` on the herdr *server's*
   `PATH`, which is what the manifest launches
+- optional: the [Codex CLI](https://developers.openai.com/codex/cli/reference/)
+  on the herdr server's `PATH` for ctrl-x archival of saved Codex branches;
+  set `CODEX_BIN_PATH` in the server environment when it lives elsewhere
 - optional: [zoxide](https://github.com/ajeetdsouza/zoxide), for folder suggestions
 - optional: `lsof`, to map an active Codex writer lock to the exact Herdr pane;
   when it is absent, only a stale reporter ID supplies direct ownership evidence,
@@ -250,8 +259,8 @@ python3 "$root/herdr-agents" --list
 
 Inside the picker: <kbd>enter</kbd> focus, switch/resume a Codex branch (or
 start, on a folder),
-<kbd>ctrl-a</kbd> choose the agent kind, <kbd>ctrl-x</kbd> forget the folder
-under the cursor, <kbd>esc</kbd> cancel.
+<kbd>ctrl-a</kbd> choose the agent kind, <kbd>ctrl-x</kbd> forget the folder or
+archive a dormant saved Codex branch, <kbd>esc</kbd> cancel.
 
 Per-folder launch history lives in
 `~/.local/state/herdr-agents/launches.json` — how many agents you have started
@@ -297,7 +306,8 @@ Things that were measured the hard way and are worth not rediscovering:
   `[[panes]]` entrypoint, and the action is only what a key can name.
 - A plugin's `PATH` is the herdr *server's*, not your shell's, and a managed
   install need not put herdr on it at all. Hence `HERDR_BIN_PATH` for every
-  callback rather than a bare `herdr`.
+  callback rather than a bare `herdr`; branch archival similarly uses `codex`
+  from that `PATH` unless the server environment supplies `CODEX_BIN_PATH`.
 - Codex keeps POSIX writer locks for both sides of an in-TUI `/fork`. Starting
   `codex resume <old-id>` in another pane therefore fails while the original
   TUI lives; `/resume <old-id>` inside that owning TUI is the safe switch.

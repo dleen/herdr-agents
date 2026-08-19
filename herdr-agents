@@ -18,6 +18,8 @@ and bindable as a plain `type = "popup"` command.
   herdr-agents --preview <row_key|§folder>  render one entry (used by fzf)
   herdr-agents --lines    print the picker's fzf input (used by its reload)
   herdr-agents --hide <§folder|folder>      drop a folder from the launch list
+  herdr-agents --dismiss <§folder|codex-session:UUID>
+                           forget a folder or archive a saved Codex branch
   herdr-agents --unhide [folder]            put it back (no argument: all)
   herdr-agents --splash [card] [seconds]    play the launch title cards and exit
 """
@@ -52,6 +54,7 @@ CODEX_WRITER_LOCKS = os.path.expanduser("~/.codex/thread-writer-locks")
 # points at rather than whatever "herdr" resolves to on PATH -- the plugin's
 # PATH is the server's, and a managed install need not have herdr on it at all.
 HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
+CODEX_BIN = os.environ.get("CODEX_BIN_PATH") or "codex"
 
 STATE_ICON = {
     "working": ("*", "\033[33m"),
@@ -94,6 +97,15 @@ def herdr(*args: str, timeout: float = 5) -> str:
     if out is None:
         return ""
     return out.stdout if out.returncode == 0 else ""
+
+
+def codex_run(*args: str, timeout: float = 5):
+    """Run a Codex CLI command, returning None if it could not be started."""
+    try:
+        return subprocess.run((CODEX_BIN,) + args, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def error_code(stderr: str) -> str:
@@ -892,6 +904,14 @@ def preview(row_key: str, events_shown: int = 16) -> int:
         else:
             action = "open codex resume in a new herdr workspace"
         print(f"\n{DIM}enter{RESET} {action}")
+        if row.get("active_writer"):
+            archive = (f"active branch: open it and use /archive; transcript is "
+                       f"preserved and restorable with codex unarchive "
+                       f"{row['session_id']}")
+        else:
+            archive = (f"archive with ctrl-x; transcript is preserved and "
+                       f"restorable with codex unarchive {row['session_id']}")
+        print(f"{DIM}ctrl-x{RESET} {archive}")
         if row.get("forked_from_id"):
             print(f"{DIM}forked from {row['forked_from_id']}{RESET}")
 
@@ -1059,6 +1079,39 @@ def hide_folder(folder: str) -> int:
     state["hidden"] = hidden[-HIDDEN_CAP:]
     state.get("folders", {}).pop(folder, None)
     save_state(state)
+    return 0
+
+
+def archive_codex_branch(session_id: str) -> int:
+    """Archive one dormant saved Codex branch without touching its transcript."""
+    if not CODEX_ID_RE.fullmatch(session_id or ""):
+        return 0
+    if codex_writer_active(session_id):
+        herdr("notification", "show", "Codex branch is active",
+              "--body", f"{session_id} is active — open it and use /archive "
+                         "in its TUI, or archive it in the external owner")
+        return 1
+
+    done = codex_run("archive", session_id, timeout=10)
+    if done is None:
+        why = "could not start the codex command"
+    elif done.returncode != 0:
+        why = flat(done.stderr) or f"archive exited with status {done.returncode}"
+    else:
+        return 0
+    herdr("notification", "show", "Could not archive Codex branch",
+          "--body", f"{session_id}: {why}")
+    return 1
+
+
+def dismiss(target: str) -> int:
+    """Dismiss a folder or archive a saved Codex branch selected by fzf."""
+    if target.startswith(HEADER_KEY):
+        return hide_folder(target[len(HEADER_KEY):])
+    if target.startswith(CODEX_KEY):
+        session_id = target[len(CODEX_KEY):]
+        if CODEX_ID_RE.fullmatch(session_id):
+            return archive_codex_branch(session_id)
     return 0
 
 
@@ -1376,6 +1429,8 @@ def main(argv: list[str]) -> int:
         target = argv[1]
         return hide_folder(target[len(HEADER_KEY):]
                            if target.startswith(HEADER_KEY) else "")
+    if len(argv) >= 2 and argv[0] == "--dismiss":
+        return dismiss(argv[1])
 
     rows, entries, counts = picker_entries()
     if "--list" in argv:
@@ -1400,7 +1455,7 @@ def main(argv: list[str]) -> int:
          "--layout=reverse", "--info=inline", "--pointer=>",
          "--prompt=agent> ",
          ("--header=enter focus, switch, or start · ctrl-a choose agent · "
-          "ctrl-x forget folder · esc cancel"),
+          "ctrl-x forget folder/archive saved branch · esc cancel"),
          "--expect=ctrl-a",
          # Land on an agent, so a reflex enter focuses rather than launching.
          # It has to be `load`, not `start`: start fires before the input is
@@ -1408,10 +1463,10 @@ def main(argv: list[str]) -> int:
          # Unbound straight after, or every ctrl-x reload would nudge the
          # cursor down again on top of the row the list just lost.
          "--bind=load:down+unbind(load)",
-         # Forget a folder without leaving the picker: the suggestion list is
-         # mostly zoxide's frecency, so it silts up with /tmp and one-off
-         # checkouts, and a dismissal is only worth making if it costs one key.
-         f"--bind=ctrl-x:execute-silent({me} --hide {{1}})+reload({me} --lines)",
+         # Dismiss a folder or saved Codex branch without leaving the picker:
+         # the suggestion list is mostly zoxide's frecency, so it silts up with
+         # /tmp and one-off checkouts, and a dismissal is only worth one key.
+         f"--bind=ctrl-x:execute-silent({me} --dismiss {{1}})+reload({me} --lines)",
          "--preview", f"{me} --preview {{1}}",
          f"--preview-window={preview_window()}"],
         input="\n".join(lines), capture_output=True, text=True, check=False)
