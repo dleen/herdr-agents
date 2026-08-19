@@ -20,6 +20,8 @@ and bindable as a plain `type = "popup"` command.
   herdr-agents --hide <§folder|folder>      drop a folder from the launch list
   herdr-agents --dismiss <§folder|codex-session:UUID>
                            forget a folder or archive a saved Codex branch
+  herdr-agents --fork-right
+                           fork this pane's Codex session into a right split
   herdr-agents --unhide [folder]            put it back (no argument: all)
   herdr-agents --splash [card] [seconds]    play the launch title cards and exit
 """
@@ -29,6 +31,7 @@ from __future__ import annotations
 import calendar
 import fcntl
 import glob
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -49,6 +52,10 @@ import time
 CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 CODEX_WRITER_LOCKS = os.path.expanduser("~/.codex/thread-writer-locks")
+FORK_LOCK_DIR = os.path.expanduser("~/.local/state/herdr-agents/fork-locks")
+FORK_VERIFY_TIMEOUT_S = 15.0
+FORK_VERIFY_POLL_S = 0.2
+EMPTY_PANE_WAIT_S = 2.0
 
 # Running as a herdr plugin, the binary to call back into is the one herdr
 # points at rather than whatever "herdr" resolves to on PATH -- the plugin's
@@ -239,6 +246,21 @@ def codex_session_index() -> dict[str, dict]:
     return sessions
 
 
+def codex_session_by_id(session_id: str) -> dict | None:
+    """Return one unambiguous active rollout header for ``session_id``."""
+    if not CODEX_ID_RE.fullmatch(session_id or ""):
+        return None
+    pattern = os.path.join(
+        CODEX_SESSIONS, "*", "*", "*", f"rollout-*-{session_id}.jsonl"
+    )
+    matches = []
+    for path in glob.iglob(pattern):
+        meta = codex_session_meta(path)
+        if meta and meta["id"] == session_id:
+            matches.append(meta)
+    return matches[0] if len(matches) == 1 else None
+
+
 def codex_fork_graph(sessions: dict[str, dict]) -> dict[str, set[str]]:
     graph: dict[str, set[str]] = {}
     for session_id, meta in sessions.items():
@@ -325,6 +347,149 @@ def codex_pane_pids(pane_id: str) -> set[int]:
     info = herdr_json("pane", "process-info", "--pane", pane_id).get("process_info") or {}
     return {process["pid"] for process in info.get("foreground_processes") or []
             if isinstance(process.get("pid"), int)}
+
+
+def normalized_path(path: str) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path))) if path else ""
+
+
+def codex_foreground_process(pane_id: str) -> tuple[dict | None, str]:
+    """Return the one local foreground Codex process in ``pane_id``."""
+    info = (herdr_json("pane", "process-info", "--pane", pane_id)
+            .get("process_info") or {})
+    if info.get("pane_id") != pane_id:
+        return None, "could not inspect the invoking pane's foreground process"
+    processes = info.get("foreground_processes") or []
+    if len(processes) != 1:
+        return None, "the invoking pane does not have exactly one foreground process"
+    process = processes[0]
+    names = [process.get("argv0"), process.get("name")]
+    argv = process.get("argv") or []
+    if argv:
+        names.append(argv[0])
+    basenames = {os.path.basename(str(name)).lower() for name in names if name}
+    if not any(name == "codex" or name.startswith("codex-") for name in basenames):
+        return None, "the invoking pane's foreground process is not local Codex"
+    if not isinstance(process.get("pid"), int) or process["pid"] <= 0:
+        return None, "the invoking pane's Codex process has no usable pid"
+    if not process.get("cwd"):
+        return None, "the invoking pane's Codex process has no working directory"
+    return process, ""
+
+
+def local_codex_pane(pane_id: str) -> tuple[dict | None, str]:
+    """Resolve a pane only when every local Codex identity source agrees."""
+    pane = herdr_json("pane", "get", pane_id).get("pane") or {}
+    if pane.get("pane_id") != pane_id:
+        return None, "the invoking Herdr pane no longer exists"
+    session = pane.get("agent_session") or {}
+    if ((session.get("agent") or pane.get("agent") or "").lower() != "codex"
+            or session.get("kind") != "id"):
+        return None, "the invoking pane is not reporting a local Codex session"
+    session_id = str(session.get("value") or "").lower()
+    if not CODEX_ID_RE.fullmatch(session_id):
+        return None, "the invoking pane has no valid Codex session id"
+
+    title_ids = {value.lower() for value in
+                 CODEX_ID_RE.findall(pane.get("terminal_title_stripped") or "")}
+    if title_ids != {session_id}:
+        return None, "Codex's terminal title and Herdr session reporter disagree"
+    meta = codex_session_by_id(session_id)
+    if not meta:
+        return None, f"could not resolve one active rollout for {session_id}"
+
+    process, why = codex_foreground_process(pane_id)
+    if not process:
+        return None, why
+    cwd_sources = {
+        normalized_path(str(pane.get("cwd") or "")),
+        normalized_path(str(pane.get("foreground_cwd") or "")),
+        normalized_path(str(process.get("cwd") or "")),
+        normalized_path(str(meta.get("cwd") or "")),
+    }
+    if "" in cwd_sources or len(cwd_sources) != 1:
+        return None, "the pane, Codex process, and rollout working directories disagree"
+
+    if not codex_writer_active(session_id):
+        return None, f"{session_id} does not have an active Codex writer lock"
+    lock_pids = codex_lock_pids(session_id)
+    if lock_pids is None:
+        return None, "lsof is required to prove Codex writer-lock ownership"
+    if lock_pids != {process["pid"]}:
+        return None, "the foreground Codex process does not uniquely own its writer lock"
+    return {
+        "pane_id": pane_id,
+        "session_id": session_id,
+        "pid": process["pid"],
+        # Preserve the user's path spelling for the child; cwd_real is the
+        # identity comparison that tolerates a symlinked checkout.
+        "cwd": str(pane["cwd"]),
+        "cwd_real": cwd_sources.pop(),
+        "meta": meta,
+    }, ""
+
+
+def verify_fork_child(parent: dict, child_pane_id: str) -> tuple[str, str]:
+    """Prove parent and child are distinct, correctly related Codex writers."""
+    current_parent, why = local_codex_pane(parent["pane_id"])
+    if not current_parent:
+        return "", f"parent verification failed: {why}"
+    stable_fields = ("session_id", "pid", "cwd", "cwd_real")
+    if any(current_parent[field] != parent[field] for field in stable_fields):
+        return "", "the parent Codex session or process changed during the fork"
+
+    child, why = local_codex_pane(child_pane_id)
+    if not child:
+        return "", f"child verification pending: {why}"
+    if child["session_id"] == parent["session_id"]:
+        return "", "the new pane reported the parent session instead of a fork"
+    if child["meta"].get("forked_from_id") != parent["session_id"]:
+        return "", "the new Codex rollout does not identify the requested parent"
+    if child["cwd_real"] != parent["cwd_real"]:
+        return "", "the fork opened in a different working directory"
+    if child["pid"] == parent["pid"]:
+        return "", "parent and child writer locks belong to the same process"
+    return child["session_id"], ""
+
+
+def wait_for_fork_child(parent: dict, child_pane_id: str,
+                        timeout: float = FORK_VERIFY_TIMEOUT_S) -> tuple[str, str]:
+    deadline = time.monotonic() + timeout
+    why = "the child Codex session did not become observable"
+    while True:
+        child_id, observed = verify_fork_child(parent, child_pane_id)
+        if child_id:
+            return child_id, ""
+        why = observed or why
+        if time.monotonic() >= deadline:
+            return "", why
+        time.sleep(FORK_VERIFY_POLL_S)
+
+
+def pane_provably_empty(pane_id: str) -> bool:
+    """True only for a created pane whose shell is idle and has no agent."""
+    pane = herdr_json("pane", "get", pane_id).get("pane") or {}
+    if pane.get("pane_id") != pane_id:
+        return False
+    if pane.get("agent") or (pane.get("agent_session") or {}).get("agent"):
+        return False
+    info = (herdr_json("pane", "process-info", "--pane", pane_id)
+            .get("process_info") or {})
+    return (info.get("pane_id") == pane_id
+            and isinstance(info.get("shell_pid"), int)
+            and not (info.get("foreground_processes") or []))
+
+
+def close_created_empty_pane(pane_id: str,
+                             timeout: float = EMPTY_PANE_WAIT_S) -> bool:
+    """Close only a pane we created and can still prove is an idle shell."""
+    deadline = time.monotonic() + timeout
+    while not pane_provably_empty(pane_id):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(FORK_VERIFY_POLL_S)
+    done = herdr_run("pane", "close", pane_id, timeout=10)
+    return done is not None and done.returncode == 0
 
 
 def flat(text: str, limit: int = 400) -> str:
@@ -1380,6 +1545,130 @@ def launch(folder: str, kind: str, agent_args: tuple[str, ...] = ()) -> int:
     return 0
 
 
+def fork_notice(title: str, body: str) -> None:
+    herdr("notification", "show", title, "--body", body)
+
+
+def command_failure(done, fallback: str) -> str:
+    if done is None:
+        return fallback
+    return (error_code(done.stderr) or flat(done.stderr)
+            or f"command exited {done.returncode}")
+
+
+def fork_pre_child_failure(child_pane_id: str, why: str) -> int:
+    closed = close_created_empty_pane(child_pane_id)
+    cleanup = ("the unused pane was closed" if closed else
+               "the new pane could not be proven empty and was left visible")
+    fork_notice("Could not fork Codex to the right", f"{why}; {cleanup}")
+    print(f"herdr-agents: fork-right failed before child startup ({why})",
+          file=sys.stderr)
+    return 1
+
+
+def fork_right_locked(pane_id: str) -> int:
+    """Fork the invoking local Codex pane without ever replacing its writer."""
+    parent, why = local_codex_pane(pane_id)
+    if not parent:
+        fork_notice("Could not fork Codex to the right", why)
+        print(f"herdr-agents: fork-right preflight failed ({why})", file=sys.stderr)
+        return 1
+
+    done = herdr_run(
+        "pane", "split", "--pane", pane_id, "--direction", "right",
+        "--cwd", parent["cwd"], "--no-focus", timeout=10,
+    )
+    if done is None or done.returncode != 0:
+        why = command_failure(done, "herdr pane split could not be run")
+        fork_notice("Could not fork Codex to the right", why)
+        print(f"herdr-agents: fork-right split failed ({why})", file=sys.stderr)
+        return 1
+    try:
+        child_pane_id = (json.loads(done.stdout).get("result", {}).get("pane", {})
+                         .get("pane_id", ""))
+    except (AttributeError, ValueError):
+        child_pane_id = ""
+    if not child_pane_id or child_pane_id == pane_id:
+        why = "Herdr did not identify the newly split pane"
+        fork_notice("Could not fork Codex to the right", why)
+        print(f"herdr-agents: fork-right split response was ambiguous ({why})",
+              file=sys.stderr)
+        return 1
+
+    # The parent remains focused after the split, so it can still switch or
+    # exit while this detached action runs. Recheck immediately before any
+    # child process is started; this is the last point where cleanup is safe.
+    current, why = local_codex_pane(pane_id)
+    stable_fields = ("session_id", "pid", "cwd", "cwd_real")
+    if (not current
+            or any(current[field] != parent[field] for field in stable_fields)):
+        why = why or "the parent Codex session changed after the pane split"
+        return fork_pre_child_failure(child_pane_id, why)
+
+    label = os.path.basename(parent["cwd"].rstrip(os.sep)) or "codex"
+    name = unique_agent_name(agent_name_base(label, "codex"))
+    started, why = start_agent(
+        name, "codex", child_pane_id,
+        agent_args=("fork", parent["session_id"]),
+    )
+    if not started.strip():
+        return fork_pre_child_failure(child_pane_id, why)
+
+    child_id, why = wait_for_fork_child(parent, child_pane_id)
+    if not child_id:
+        fork_notice(
+            "Codex fork needs inspection",
+            f"{why}; {child_pane_id} was left visible because child state is ambiguous",
+        )
+        print(f"herdr-agents: fork-right child verification failed ({why})",
+              file=sys.stderr)
+        return 1
+
+    focused = herdr_run("agent", "focus", child_pane_id, timeout=10)
+    if focused is None or focused.returncode != 0:
+        why = command_failure(focused, "herdr agent focus could not be run")
+        fork_notice(
+            "Codex fork created",
+            f"{child_id} is running in {child_pane_id}, but focus failed: {why}",
+        )
+        return 1
+    return 0
+
+
+def fork_right() -> int:
+    """Serialize fork-right invocations originating from the same pane."""
+    pane_id = os.environ.get("HERDR_PANE_ID") or ""
+    if not pane_id:
+        print("herdr-agents: HERDR_PANE_ID is not set", file=sys.stderr)
+        return 1
+    try:
+        os.makedirs(FORK_LOCK_DIR, exist_ok=True)
+        digest = hashlib.sha256(pane_id.encode()).hexdigest()
+        lock_path = os.path.join(FORK_LOCK_DIR, f"{digest}.lock")
+        # Open separately so creation errors can be reported before entering
+        # the context that owns acquisition and release.
+        lock_file = open(lock_path, "a+")  # noqa: SIM115
+    except OSError as exc:
+        why = f"could not create the per-pane fork lock: {flat(exc)}"
+        fork_notice("Could not fork Codex to the right", why)
+        return 1
+    with lock_file:
+        try:
+            fcntl.lockf(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fork_notice("Codex fork already starting",
+                        f"another fork-right action is active for {pane_id}")
+            return 1
+        except OSError as exc:
+            why = f"could not acquire the per-pane fork lock: {flat(exc)}"
+            fork_notice("Could not fork Codex to the right", why)
+            return 1
+        try:
+            return fork_right_locked(pane_id)
+        finally:
+            fcntl.lockf(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def choose_kind(folder: str) -> str:
     """The second step of ctrl-a: which agent to start here."""
     _, picked = pick(kinds_available(),
@@ -1421,6 +1710,8 @@ def main(argv: list[str]) -> int:
     if os.environ.get("HERDR_ENV") != "1" and "--list" not in argv:
         print("herdr-agents: not inside a herdr session", file=sys.stderr)
         return 1
+    if argv[:1] == ["--fork-right"]:
+        return fork_right()
     if len(argv) >= 2 and argv[0] == "--preview":
         return preview(argv[1])
     if len(argv) >= 2 and argv[0] == "--hide":

@@ -1,8 +1,8 @@
 id = "dleen.herdr-agents"
 name = "Agent picker"
-version = "0.2.1"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
-description = "An fzf picker for live agent panes and Codex fork branches, with owner-safe switching and transcript previews."
+description = "An agent picker plus an owner-safe action that forks local Codex sessions into a right split."
 platforms = ["linux", "macos"]
 
 # The picker is fzf: it needs a terminal, so it is a pane entrypoint rather
@@ -27,3 +27,13 @@ id = "open"
 title = "Open the agent picker"
 contexts = ["workspace"]
 command = ["sh", "open-picker.sh"]
+
+# Fork the Codex session in the invoking pane into a child on its right. The
+# script verifies reporter/title/rollout/cwd/process/lock identity before it
+# splits, starts `codex fork <parent>` without replacing the parent, and focuses
+# the child only after both writer locks have distinct owners.
+[[actions]]
+id = "fork-right"
+title = "Fork Codex into a pane on the right"
+contexts = ["workspace"]
+command = ["python3", "herdr-agents", "--fork-right"]

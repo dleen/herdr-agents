@@ -3,7 +3,8 @@
 An fzf picker for every agent pane [herdr](https://herdr.dev) knows about —
 bound to a key, it opens as a popup, lists your agents worst-first, previews
 what each one has actually been doing, and starts new ones in folders that
-have nothing running. Installs as a herdr plugin:
+have nothing running. A second action forks the active Codex session into a
+new pane on its right. Installs as a herdr plugin:
 
 ```sh
 herdr plugin install dleen/herdr-agents
@@ -49,6 +50,14 @@ preview.
   Codex's “already has an active writer” error. Native Codex subagents also use
   `forked_from_id`, so their non-user rollout source is explicitly excluded.
   See [Codex slash commands](https://developers.openai.com/codex/cli/slash-commands/).
+- **Fork the active Codex session into a right split.** Bind the plugin's
+  `fork-right` action and it validates that the invoking pane's reporter,
+  terminal title, rollout cwd, foreground Codex PID, and writer lock all name
+  the same local session. It then keeps that parent untouched, splits right,
+  and starts `codex fork <parent-id>` in the child. The child is focused only
+  after its rollout points back to the parent and the two locks have distinct
+  owners. Native `/fork` is unchanged; Codex does not expose a slash-command
+  dispatch hook for redirecting it into Herdr layout safely.
 - **The terminal title wins during Codex's reporter lag.** Immediately after a
   fork or resume, Codex puts the new session ID in its title before Herdr's
   lifecycle hook reports it. A related title ID is therefore treated as the
@@ -115,12 +124,12 @@ preview.
 - Python 3.10+ (no third-party packages) — as `python3` on the herdr *server's*
   `PATH`, which is what the manifest launches
 - optional: the [Codex CLI](https://developers.openai.com/codex/cli/reference/)
-  on the herdr server's `PATH` for ctrl-x archival of saved Codex branches;
+  on the herdr server's `PATH` for ctrl-x archival and the `fork-right` action;
   set `CODEX_BIN_PATH` in the server environment when it lives elsewhere
 - optional: [zoxide](https://github.com/ajeetdsouza/zoxide), for folder suggestions
-- optional: `lsof`, to map an active Codex writer lock to the exact Herdr pane;
-  when it is absent, only a stale reporter ID supplies direct ownership evidence,
-  and other active branches fail closed
+- optional for the picker, required by `fork-right`: `lsof`, to map an active
+  Codex writer lock to the exact Herdr foreground process; when it is absent,
+  active branch ownership and external forking fail closed
 
 ## Install
 
@@ -153,6 +162,12 @@ key = "prefix+a"
 type = "plugin_action"
 command = "dleen.herdr-agents.open"
 description = "pick an agent"
+
+[[keys.command]]
+key = "prefix+f"
+type = "plugin_action"
+command = "dleen.herdr-agents.fork-right"
+description = "fork Codex right"
 ```
 
 Then `herdr config check` and `herdr server reload-config` (`prefix+shift+r`).
