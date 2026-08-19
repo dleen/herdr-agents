@@ -1454,8 +1454,8 @@ def main(argv: list[str]) -> int:
         ["fzf", "--ansi", "--with-nth=2..", "--delimiter=\t",
          "--layout=reverse", "--info=inline", "--pointer=>",
          "--prompt=agent> ",
-         ("--header=enter focus, switch, or start · ctrl-a choose agent · "
-          "ctrl-x forget folder/archive saved branch · esc cancel"),
+         ("--header=enter focus/start · ctrl-a kind · "
+          "ctrl-x forget/archive saved branch · esc cancel"),
          "--expect=ctrl-a",
          # Land on an agent, so a reflex enter focuses rather than launching.
          # It has to be `load`, not `start`: start fires before the input is
