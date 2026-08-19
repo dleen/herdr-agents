@@ -24,6 +24,7 @@ and bindable as a plain `type = "popup"` command.
 
 from __future__ import annotations
 
+import calendar
 import glob
 import importlib.machinery
 import importlib.util
@@ -40,8 +41,10 @@ import time
 
 # Panes are matched to a transcript so the picker can show a last message and
 # an age. Claude reports a session id and stores <cwd-slug>/<id>.jsonl; pi
-# reports the transcript path outright.
+# reports the transcript path outright; codex reports an id and files its
+# rollout under a date path.
 CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
+CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 
 # Running as a herdr plugin, the binary to call back into is the one herdr
 # points at rather than whatever "herdr" resolves to on PATH -- the plugin's
@@ -134,6 +137,12 @@ def transcript_path(pane: dict) -> str | None:
     if session.get("kind") == "path":
         return session.get("value")
     if session.get("kind") == "id" and session.get("value"):
+        if (session.get("agent") or pane.get("agent") or "").lower() == "codex":
+            # ~/.codex/sessions/YYYY/MM/DD/rollout-<stamp>-<id>.jsonl. The date
+            # is the session's, not today's, so glob rather than compute it.
+            found = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*",
+                                           f"rollout-*-{session['value']}.jsonl"))
+            return found[0] if found else None
         slug = (pane.get("cwd") or "").replace("/", "-")
         candidate = os.path.join(CLAUDE_PROJECTS, slug, session["value"] + ".jsonl")
         if os.path.exists(candidate):
@@ -184,11 +193,17 @@ def tool_label(name: str, args: dict) -> str:
 
 
 def stamp(value) -> float:
-    """Transcript timestamps are UTC ISO; return epoch seconds (0 if absent)."""
+    """Transcript timestamps are UTC ISO; return epoch seconds (0 if absent).
+
+    timegm, not mktime minus time.timezone: that offset is the zone's standard
+    one and ignores DST, so every parsed time was an hour early for half the
+    year. Harmless while these only fed a duration, wrong the moment a clock
+    time is printed.
+    """
     if not value:
         return 0.0
     try:
-        return time.mktime(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        return float(calendar.timegm(time.strptime(str(value)[:19], "%Y-%m-%dT%H:%M:%S")))
     except ValueError:
         return 0.0
 
@@ -287,10 +302,36 @@ def read_session(path: str | None, tail_bytes: int = 12_000_000) -> dict:
     return out
 
 
-def age(path: str | None) -> str:
-    if not path or not os.path.exists(path):
+def session_times(path: str | None) -> tuple[float, float]:
+    """(created, last activity) for a transcript, as epoch seconds; 0.0 if unknown.
+
+    Both come from the file, because herdr's API carries no time at all: pane,
+    agent and snapshot responses expose `revision` and `state_change_seq`
+    (monotonic counters) and a `focused` flag, but no created-at, no
+    last-state-change and no last-focused stamp. So "when did I last look at
+    this pane" is not recoverable — "when did this session last do something"
+    is, and it is the better question anyway.
+
+    Creation is the file's birth time, which is the first write rather than the
+    process start: measured a few seconds to two minutes late, since an agent
+    opens its transcript when it has something to put in it. Fine for ranking
+    and for "how long has this been going". st_birthtime is missing on Linux,
+    where ctime is the closest thing available.
+    """
+    if not path:
+        return (0.0, 0.0)
+    try:
+        info = os.stat(path)
+    except OSError:
+        return (0.0, 0.0)
+    return (getattr(info, "st_birthtime", None) or info.st_ctime, info.st_mtime)
+
+
+def ago(when: float) -> str:
+    """An age in at most four cells: 45s, 12m, 3h, 5d ('' if unknown)."""
+    if not when:
         return ""
-    delta = time.time() - os.path.getmtime(path)
+    delta = max(0.0, time.time() - when)
     if delta < 90:
         return f"{int(delta)}s"
     if delta < 5400:
@@ -298,6 +339,15 @@ def age(path: str | None) -> str:
     if delta < 172_800:
         return f"{int(delta / 3600)}h"
     return f"{int(delta / 86400)}d"
+
+
+def clock(when: float) -> str:
+    """Absolute local time, gaining a weekday once it is not today."""
+    if not when:
+        return ""
+    local = time.localtime(when)
+    same_day = time.strftime("%Y-%m-%d", local) == time.strftime("%Y-%m-%d")
+    return time.strftime("%H:%M" if same_day else "%a %H:%M", local)
 
 
 def collect() -> list[dict]:
@@ -311,6 +361,7 @@ def collect() -> list[dict]:
             continue
         space = spaces.get(pane.get("workspace_id"), {})
         path = transcript_path(pane)
+        born, active = session_times(path)
         rows.append({
             "pane_id": pane["pane_id"],
             "workspace_id": pane.get("workspace_id", ""),
@@ -323,11 +374,27 @@ def collect() -> list[dict]:
             "title": pane.get("terminal_title_stripped") or "",
             "cwd": pane.get("cwd") or "",
             "transcript": path,
-            "age": age(path),
+            "born_at": born,
+            "active_at": active,
+            "age": ago(active),
+            "born": ago(born),
         })
-    # Anything wanting a human first, then the busy ones, then the rest.
-    rows.sort(key=lambda r: (URGENCY.get(r["state"], 4), r["number"]))
+    rows.sort(key=order)
     return rows
+
+
+def order(row: dict) -> tuple:
+    """Anything wanting a human first, then the busy ones, then the rest — and
+    inside a tier, whatever moved most recently.
+
+    State alone stops sorting the moment a screenful of agents is all idle,
+    which is the normal state of a long session: a dozen rows in one bucket,
+    ordered by workspace number, so the one you were in five minutes ago sits
+    wherever it was created. Recency breaks that tie the way you would by hand.
+    A row with no transcript has no time to rank by and sinks to the bottom of
+    its tier, where workspace number still orders it.
+    """
+    return (URGENCY.get(row["state"], 4), -row["active_at"], row["number"])
 
 
 # Groups are keyed on the full cwd, not the workspace label: two worktrees of
@@ -339,22 +406,22 @@ def group_by_folder(rows: list[dict], extra: int = 12) -> list[tuple[str, object
     """Rows bucketed by cwd, each bucket led by a folder entry.
 
     Buckets are ordered by their most urgent agent so a folder with something
-    waiting on a human still floats to the top. Folders with nothing running
-    follow, so the same list answers both "go to an agent" and "start one
-    somewhere else".
+    waiting on a human still floats to the top, then by their most recently
+    active one so a quiet checkout does not outrank the one you are working in.
+    Folders with nothing running follow, so the same list answers both "go to
+    an agent" and "start one somewhere else".
     """
     folders: dict[str, list[dict]] = {}
     for row in rows:
         folders.setdefault(row["cwd"] or "?", []).append(row)
     ordered = sorted(folders.items(),
                      key=lambda kv: (min(URGENCY.get(r["state"], 4) for r in kv[1]),
+                                     -max(r["active_at"] for r in kv[1]),
                                      kv[0]))
     out: list[tuple[str, object]] = []
     for folder, members in ordered:
         out.append(("header", folder))
-        out.extend(("row", r) for r in
-                   sorted(members, key=lambda r: (URGENCY.get(r["state"], 4),
-                                                  r["number"])))
+        out.extend(("row", r) for r in sorted(members, key=order))
     for folder in recent_folders(limit=len(folders) + extra):
         if folder not in folders:
             out.append(("header", folder))
@@ -390,9 +457,14 @@ def render(row: dict, color: bool = True, folder: bool = False) -> str:
     icon, hue = STATE_ICON.get(row["state"], STATE_ICON["unknown"])
     on, off, dim = (hue, RESET, DIM) if color else ("", "", "")
     state = STATE_TEXT.get(row["state"], row["state"])
-    head = f"  {on}{icon}{off} {row['number']:>1}  {state:<11} {row['age']:>4}"
+    # Two ages, closest thing first: how long since it did anything, then how
+    # long it has existed. The second is dimmed because it never changes what
+    # you do next -- it is there to tell a session opened after lunch from one
+    # that has been grinding since Tuesday.
+    head = (f"  {on}{icon}{off} {row['number']:>2}  {state:<11} "
+            f"{row['age']:>4} {dim}{row['born']:>4}{off}")
     tail = f"  {short_path(row['cwd'])}" if folder and row.get("cwd") else ""
-    return f"{head}  {dim}{row['agent']:<6} {row['title'][:70]}{tail}{off}"
+    return f"{head} {dim}{row['agent']:<6} {row['title'][:70]}{tail}{off}"
 
 
 CYAN = "\033[36m"
@@ -439,17 +511,17 @@ def collapse(events: list, width: int) -> list:
         run.clear()
 
     for when, kind, text, name in events:
-        clock = time.strftime("%H:%M", time.localtime(when)) if when else ""
+        at = time.strftime("%H:%M", time.localtime(when)) if when else ""
         if kind == "tool":
             run.append((name, text))
             continue
         flush()
         mark, hue = ("▸", CYAN) if kind == "prompt" else ("⤷", "")
-        lines.append((clock, mark, hue, text))
+        lines.append((at, mark, hue, text))
     flush()
     cap = max(20, width - 9)
-    return [(c, m, h, t if len(t) <= cap else t[: cap - 1] + "…")
-            for c, m, h, t in lines]
+    return [(a, m, h, t if len(t) <= cap else t[: cap - 1] + "…")
+            for a, m, h, t in lines]
 
 
 def tokens_short(count: int) -> str:
@@ -458,13 +530,6 @@ def tokens_short(count: int) -> str:
     if count >= 1000:
         return f"{count // 1000}k tok"
     return f"{count} tok" if count else ""
-
-
-def duration(seconds: float) -> str:
-    if seconds <= 0:
-        return ""
-    hours, minutes = int(seconds // 3600), int(seconds % 3600 // 60)
-    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
 
 
 def preview_folder(folder: str) -> int:
@@ -484,7 +549,7 @@ def preview_folder(folder: str) -> int:
 
     info = load_state().get("folders", {}).get(folder) or {}
     started = (f"{info['count']}× from here, last {info['kind']} "
-               f"{age_of(info['last'])} ago" if info.get("last") else
+               f"{ago(info['last'])} ago" if info.get("last") else
                "never started from here")
     print(f"\n{DIM}enter{RESET} start {default_kind(folder)}   "
           f"{DIM}ctrl-a{RESET} choose agent   "
@@ -519,7 +584,10 @@ def preview(pane_id: str, events_shown: int = 16) -> int:
         print("pane is gone")
         return 0
     width = int(os.environ.get("FZF_PREVIEW_COLUMNS") or 78)
-    session = read_session(row["transcript"])
+    # Codex files a rollout in its own schema (response_item / event_msg), which
+    # this parser does not read: its transcript is used for times only, and
+    # parsing it would buy an empty summary for a multi-megabyte read.
+    session = read_session(row["transcript"] if row["agent"] != "codex" else None)
 
     print(f"\033[1m{row['label']}\033[0m  {row['agent']}  "
           f"{STATE_TEXT.get(row['state'], row['state'])}"
@@ -527,6 +595,18 @@ def preview(pane_id: str, events_shown: int = 16) -> int:
     model = (session["model"] or "").replace("claude-", "")
     meta = [row["cwd"].replace(os.path.expanduser("~"), "~"), row["pane_id"], model]
     print(f"{DIM}{'  ·  '.join(m for m in meta if m)}{RESET}")
+
+    # Wall clock, not just ages: "started 09:11" is what you match against your
+    # own memory of the morning. The transcript's first record beats the file's
+    # birth time when it is there, being the session's own idea of when it began.
+    when = []
+    began = session["started"] or row["born_at"]
+    if began:
+        when.append(f"started {clock(began)} ({ago(began)} ago)")
+    if row["active_at"]:
+        when.append(f"last active {clock(row['active_at'])} ({row['age']} ago)")
+    if when:
+        print(f"{DIM}{'  ·  '.join(when)}{RESET}")
 
     title = session["title"] or row["title"]
     if title:
@@ -540,9 +620,6 @@ def preview(pane_id: str, events_shown: int = 16) -> int:
         stats.append(f"{session['commits']} commits")
     if session["errors"]:
         stats.append(f"{session['errors']} tool errors")
-    span = duration(time.time() - session["started"]) if session["started"] else ""
-    if span:
-        stats.append(span)
     if session["tokens"]:
         stats.append(tokens_short(session["tokens"]))
     if session["prompts"] or session["tools"]:
@@ -559,8 +636,8 @@ def preview(pane_id: str, events_shown: int = 16) -> int:
             if last_ask:
                 shown = [last_ask] + shown[1:]
         print(f"\n{DIM}activity{RESET}")
-        for clock, mark, hue, text in shown:
-            stamped = f"{DIM}{clock:<5}{RESET}"
+        for at, mark, hue, text in shown:
+            stamped = f"{DIM}{at:<5}{RESET}"
             print(f"{stamped} {hue}{mark} {text}{RESET if hue else ''}")
 
     if session["files"]:
@@ -715,15 +792,6 @@ def default_kind(folder: str) -> str:
     state = load_state()
     per_folder = (state.get("folders", {}).get(folder) or {}).get("kind")
     return per_folder or (kinds_available() or ["claude"])[0]
-
-
-def age_of(when: float) -> str:
-    delta = max(0.0, time.time() - when)
-    if delta < 5400:
-        return f"{int(delta / 60)}m"
-    if delta < 172_800:
-        return f"{int(delta / 3600)}h"
-    return f"{int(delta / 86400)}d"
 
 
 def pick(lines: list[str], prompt: str, header: str,

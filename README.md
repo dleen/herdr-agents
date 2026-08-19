@@ -12,12 +12,17 @@ herdr plugin install dleen/herdr-agents
 ```
 agent> ▏
   ~/code/service-a  (2)
-    ! 3  needs input   12s  claude  waiting on approval to force-push
-    * 1  working       2s   pi      refactoring the retry loop
+    !  3  needs input   12s  3h   claude  waiting on approval to force-push
+    *  1  working        2s  20m  pi      refactoring the retry loop
   ~/code/notes  (1)
-    o 4  idle          8m   codex   —
+    o  4  idle           8m   2d  codex   —
   ~/code/infra  + pi
 ```
+
+The two age columns are **how long since it last did anything** and **how long
+the session has existed** — the second dimmed, because it never changes what
+you do next, only whether you are looking at something opened after lunch or
+something that has been grinding since Tuesday.
 
 Herdr's own sidebar agents panel is a ~30-column rail, and it lists only the
 panes whose agent state herdr managed to detect — a pane whose agent process it
@@ -29,17 +34,30 @@ preview.
 
 - **One row per agent pane**, grouped by working directory (full `cwd`, so two
   worktrees of the same repo stay distinct) and sorted worst-first: blocked →
-  working → idle/done → unknown. A folder with something waiting on a human
-  floats to the top of the list.
+  working → idle/done → unknown, then most recently active first. A folder with
+  something waiting on a human floats to the top of the list; state alone stops
+  sorting anything once a long session's agents are all idle, which is most of
+  them most of the time.
+- **Times come from the transcript, because herdr has none.** `pane list`,
+  `agent list` and `api snapshot` carry `revision` and `state_change_seq`
+  (monotonic counters) and a `focused` flag — no created-at, no
+  last-state-change, no last-focused stamp. So *when you last looked at a pane*
+  is not recoverable anywhere; the file its agent appends to is the only clock,
+  giving last activity (its mtime) and session start (its birth time, landing a
+  few seconds after the process actually began).
 - **State repair.** A pane herdr never bound to a detected agent keeps
   `agent_status: unknown` forever, even while the agent sits at a prompt. The
   picker feeds that pane's screen to `herdr agent explain` and gets the real
   state back.
 - **A preview that reconstructs the session** from its transcript (Claude's
-  `~/.claude/projects/<slug>/<id>.jsonl`, or the path pi reports): the prompts,
-  the replies, shell and edit work folded into named runs rather than 114 bash
-  lines, turn/tool/commit/token counts, files touched, the last message, then
-  the pane's live screen.
+  `~/.claude/projects/<slug>/<id>.jsonl`, the path pi reports, or codex's
+  `~/.codex/sessions/<date>/rollout-<stamp>-<id>.jsonl`): wall-clock start and
+  last-activity times, the prompts, the replies, shell and edit work folded
+  into named runs rather than 114 bash lines, turn/tool/commit/token counts,
+  files touched, the last message, then the pane's live screen. Codex writes a
+  different schema (`response_item` / `event_msg`), so its rollout supplies the
+  times and nothing else — parsing it would buy an empty summary for a
+  multi-megabyte read.
 - **One list, two verbs.** <kbd>enter</kbd> on an agent focuses it;
   <kbd>enter</kbd> on a folder starts an agent there — which is why folders with
   nothing running are in the list at all. Candidate folders come from launch
