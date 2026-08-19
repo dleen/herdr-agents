@@ -16,6 +16,7 @@ agent> ▏
     *  1  working        2s  20m  pi      refactoring the retry loop
   ~/code/notes  (1)
     o  4  idle           8m   2d  codex   —
+    ↳  4  branch         9m   2d  codex   fork parent · switch in 4 · 01a0…
   ~/code/infra  + pi
 ```
 
@@ -32,12 +33,27 @@ preview.
 
 ## What it does
 
-- **One row per agent pane**, grouped by working directory (full `cwd`, so two
-  worktrees of the same repo stay distinct) and sorted worst-first: blocked →
+- **One row per agent pane, plus saved Codex fork branches**, grouped by working
+  directory (full `cwd`, so two worktrees of the same repo stay distinct) and
+  sorted worst-first: blocked →
   working → idle/done → unknown, then most recently active first. A folder with
   something waiting on a human floats to the top of the list; state alone stops
   sorting anything once a long session's agents are all idle, which is most of
   them most of the time.
+- **`/fork` stays selectable without a second writer.** The picker reads the
+  rollout headers' `id`, `forked_from_id`, and `cwd` fields and shows the saved
+  peers of every live Codex session. If the branch's writer lock belongs to a
+  live Herdr pane, enter sends the supported `/resume <id>` command to that
+  existing TUI and focuses it. A dormant branch starts `codex resume <id>` in a
+  new workspace; a lock owned outside Herdr is refused instead of reproducing
+  Codex's “already has an active writer” error. Native Codex subagents also use
+  `forked_from_id`, so their non-user rollout source is explicitly excluded.
+  See [Codex slash commands](https://developers.openai.com/codex/cli/slash-commands/).
+- **The terminal title wins during Codex's reporter lag.** Immediately after a
+  fork or resume, Codex puts the new session ID in its title before Herdr's
+  lifecycle hook reports it. A related title ID is therefore treated as the
+  current branch, preventing the just-created child from being mislabeled as
+  the saved one.
 - **Times come from the transcript, because herdr has none.** `pane list`,
   `agent list` and `api snapshot` carry `revision` and `state_change_seq`
   (monotonic counters) and a `focused` flag — no created-at, no
@@ -58,7 +74,8 @@ preview.
   different schema (`response_item` / `event_msg`), so its rollout supplies the
   times and nothing else — parsing it would buy an empty summary for a
   multi-megabyte read.
-- **One list, two verbs.** <kbd>enter</kbd> on an agent focuses it;
+- **One list, three routes.** <kbd>enter</kbd> on an agent focuses it; on a
+  Codex branch it switches the owning TUI or resumes a dormant session;
   <kbd>enter</kbd> on a folder starts an agent there — which is why folders with
   nothing running are in the list at all. Candidate folders come from launch
   history, then herdr's panes, then [zoxide](https://github.com/ajeetdsouza/zoxide).
@@ -92,6 +109,9 @@ preview.
 - Python 3.10+ (no third-party packages) — as `python3` on the herdr *server's*
   `PATH`, which is what the manifest launches
 - optional: [zoxide](https://github.com/ajeetdsouza/zoxide), for folder suggestions
+- optional: `lsof`, to map an active Codex writer lock to the exact Herdr pane;
+  when it is absent, only a stale reporter ID supplies direct ownership evidence,
+  and other active branches fail closed
 
 ## Install
 
@@ -208,7 +228,7 @@ sidebar_collapsed_mode = "compact"
 |---|---|
 | `herdr-agents` | the picker (needs `HERDR_ENV=1`, i.e. a pane inside herdr) |
 | `herdr-agents --list` | print the rows; launches and focuses nothing, works anywhere |
-| `herdr-agents --preview <pane_id\|§folder>` | render one entry — this is what fzf calls back |
+| `herdr-agents --preview <row_key\|§folder>` | render one entry — this is what fzf calls back |
 | `herdr-agents --splash [card] [seconds]` | play the launch title cards and exit |
 
 Installed as a plugin there is no `herdr-agents` on your `PATH`, and the
@@ -228,7 +248,8 @@ root=$(herdr plugin list --plugin dleen.herdr-agents --json | jq -r '.result.plu
 python3 "$root/herdr-agents" --list
 ```
 
-Inside the picker: <kbd>enter</kbd> focus (or start, on a folder),
+Inside the picker: <kbd>enter</kbd> focus, switch/resume a Codex branch (or
+start, on a folder),
 <kbd>ctrl-a</kbd> choose the agent kind, <kbd>ctrl-x</kbd> forget the folder
 under the cursor, <kbd>esc</kbd> cancel.
 
@@ -277,3 +298,6 @@ Things that were measured the hard way and are worth not rediscovering:
 - A plugin's `PATH` is the herdr *server's*, not your shell's, and a managed
   install need not put herdr on it at all. Hence `HERDR_BIN_PATH` for every
   callback rather than a bare `herdr`.
+- Codex keeps POSIX writer locks for both sides of an in-TUI `/fork`. Starting
+  `codex resume <old-id>` in another pane therefore fails while the original
+  TUI lives; `/resume <old-id>` inside that owning TUI is the safe switch.

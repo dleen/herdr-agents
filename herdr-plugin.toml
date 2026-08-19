@@ -1,8 +1,8 @@
 id = "dleen.herdr-agents"
 name = "Agent picker"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
-description = "An fzf picker for every agent pane herdr knows about, worst-first, with a preview that reconstructs each session from its transcript."
+description = "An fzf picker for live agent panes and Codex fork branches, with owner-safe switching and transcript previews."
 platforms = ["linux", "macos"]
 
 # The picker is fzf: it needs a terminal, so it is a pane entrypoint rather
