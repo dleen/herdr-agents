@@ -83,7 +83,8 @@ class LocalCodexPaneTests(unittest.TestCase):
         return response
 
     def resolve(self, pane: dict, process: dict, *, meta_cwd: str = CWD,
-                lock_pids: set[int] | None = None):
+                lock_pids: set[int] | None = None,
+                allow_unreported_title: bool = False):
         meta = {"id": PARENT_ID, "forked_from_id": "", "cwd": meta_cwd}
         with (
             mock.patch.object(
@@ -96,7 +97,10 @@ class LocalCodexPaneTests(unittest.TestCase):
                 return_value={101} if lock_pids is None else lock_pids,
             ),
         ):
-            return AGENTS.local_codex_pane(PARENT_PANE)
+            return AGENTS.local_codex_pane(
+                PARENT_PANE,
+                allow_unreported_title=allow_unreported_title,
+            )
 
     def test_resolves_only_when_reporter_title_rollout_process_cwd_and_lock_agree(self):
         parent, why = self.resolve(self.pane(), self.process())
@@ -111,6 +115,45 @@ class LocalCodexPaneTests(unittest.TestCase):
 
         self.assertIsNone(parent)
         self.assertIn("title", why)
+
+    def test_accepts_an_unreported_child_only_when_explicitly_allowed(self):
+        pane = self.pane()
+        pane["agent_session"] = None
+
+        parent, why = self.resolve(pane, self.process())
+        self.assertIsNone(parent)
+        self.assertIn("not reporting", why)
+
+        parent, why = self.resolve(
+            pane, self.process(), allow_unreported_title=True,
+        )
+        self.assertEqual(why, "")
+        self.assertEqual(parent["session_id"], PARENT_ID)
+
+    def test_unreported_child_still_requires_one_title_session(self):
+        pane = self.pane()
+        pane["agent_session"] = None
+        pane["terminal_title_stripped"] = "repo | main"
+
+        parent, why = self.resolve(
+            pane, self.process(), allow_unreported_title=True,
+        )
+
+        self.assertIsNone(parent)
+        self.assertIn("title", why)
+
+    def test_title_fallback_rejects_present_but_malformed_reporter_data(self):
+        for reporter in ({}, "not-a-mapping"):
+            with self.subTest(reporter=reporter):
+                pane = self.pane()
+                pane["agent_session"] = reporter
+
+                parent, why = self.resolve(
+                    pane, self.process(), allow_unreported_title=True,
+                )
+
+                self.assertIsNone(parent)
+                self.assertIn("session", why)
 
     def test_rejects_cloud_attach_instead_of_local_codex(self):
         parent, why = self.resolve(self.pane(), self.process(name="ssh"))
@@ -160,10 +203,14 @@ class ForkChildVerificationTests(unittest.TestCase):
         }
         with mock.patch.object(
             AGENTS, "local_codex_pane", side_effect=[(parent, ""), (child, "")]
-        ):
+        ) as resolve:
             child_id, why = AGENTS.verify_fork_child(parent, CHILD_PANE)
 
         self.assertEqual((child_id, why), (CHILD_ID, ""))
+        self.assertEqual(
+            resolve.call_args_list[-1],
+            mock.call(CHILD_PANE, allow_unreported_title=True),
+        )
 
     def test_rejects_same_writer_or_wrong_parent(self):
         cases = (
@@ -229,6 +276,8 @@ class ForkRightWorkflowTests(unittest.TestCase):
         self.assertIn("--no-focus", split_args)
         self.assertEqual(split_args[split_args.index("--direction") + 1], "right")
         self.assertEqual(split_args[split_args.index("--cwd") + 1], CWD)
+        self.assertEqual(split_args[split_args.index("CODEX_THREAD_ID=") - 1], "--env")
+        self.assertEqual(split_args[split_args.index("CODEX_SESSION_ID=") - 1], "--env")
         start.assert_called_once_with(
             "repo-codex", "codex", CHILD_PANE,
             agent_args=("fork", PARENT_ID),

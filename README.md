@@ -54,10 +54,13 @@ preview.
   `fork-right` action and it validates that the invoking pane's reporter,
   terminal title, rollout cwd, foreground Codex PID, and writer lock all name
   the same local session. It then keeps that parent untouched, splits right,
-  and starts `codex fork <parent-id>` in the child. The child is focused only
-  after its rollout points back to the parent and the two locks have distinct
-  owners. Native `/fork` is unchanged; Codex does not expose a slash-command
-  dispatch hook for redirecting it into Herdr layout safely.
+  clears the inherited parent identity, and starts `codex fork <parent-id>` in
+  the child. The child is focused only after its rollout points back to the
+  parent and the two locks have distinct owners. A new child does not report
+  its session until its next turn, so verification corroborates its title with
+  the rollout, cwd, foreground process, and lock instead of injecting a prompt.
+  Native `/fork` is unchanged; Codex does not expose a slash-command dispatch
+  hook for redirecting it into Herdr layout safely.
 - **The terminal title wins during Codex's reporter lag.** Immediately after a
   fork or resume, Codex puts the new session ID in its title before Herdr's
   lifecycle hook reports it. A related title ID is therefore treated as the

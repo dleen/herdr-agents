@@ -377,23 +377,37 @@ def codex_foreground_process(pane_id: str) -> tuple[dict | None, str]:
     return process, ""
 
 
-def local_codex_pane(pane_id: str) -> tuple[dict | None, str]:
-    """Resolve a pane only when every local Codex identity source agrees."""
+def local_codex_pane(pane_id: str, *,
+                     allow_unreported_title: bool = False) -> tuple[dict | None, str]:
+    """Resolve a pane only when every available local Codex identity agrees."""
     pane = herdr_json("pane", "get", pane_id).get("pane") or {}
     if pane.get("pane_id") != pane_id:
         return None, "the invoking Herdr pane no longer exists"
-    session = pane.get("agent_session") or {}
-    if ((session.get("agent") or pane.get("agent") or "").lower() != "codex"
-            or session.get("kind") != "id"):
+    reported_session = pane.get("agent_session")
+    if reported_session is not None and not isinstance(reported_session, dict):
+        return None, "the invoking pane has malformed Codex session reporter data"
+    session = reported_session or {}
+    if (session.get("agent") or pane.get("agent") or "").lower() != "codex":
         return None, "the invoking pane is not reporting a local Codex session"
-    session_id = str(session.get("value") or "").lower()
-    if not CODEX_ID_RE.fullmatch(session_id):
-        return None, "the invoking pane has no valid Codex session id"
 
     title_ids = {value.lower() for value in
                  CODEX_ID_RE.findall(pane.get("terminal_title_stripped") or "")}
-    if title_ids != {session_id}:
-        return None, "Codex's terminal title and Herdr session reporter disagree"
+    if reported_session is not None:
+        session_id = str(session.get("value") or "").lower()
+        if session.get("kind") != "id" or not CODEX_ID_RE.fullmatch(session_id):
+            return None, "the invoking pane has no valid Codex session id"
+        if title_ids != {session_id}:
+            return None, "Codex's terminal title and Herdr session reporter disagree"
+    elif allow_unreported_title:
+        # A newly forked Codex TUI does not emit its SessionStart reporter until
+        # its first new turn. Do not manufacture a prompt just to activate it:
+        # the title is acceptable only while every stronger source below
+        # (rollout, cwd, foreground process, and writer lock) corroborates it.
+        if len(title_ids) != 1:
+            return None, "Codex's terminal title does not identify one session"
+        session_id = next(iter(title_ids))
+    else:
+        return None, "the invoking pane is not reporting a local Codex session"
     meta = codex_session_by_id(session_id)
     if not meta:
         return None, f"could not resolve one active rollout for {session_id}"
@@ -438,7 +452,9 @@ def verify_fork_child(parent: dict, child_pane_id: str) -> tuple[str, str]:
     if any(current_parent[field] != parent[field] for field in stable_fields):
         return "", "the parent Codex session or process changed during the fork"
 
-    child, why = local_codex_pane(child_pane_id)
+    child, why = local_codex_pane(
+        child_pane_id, allow_unreported_title=True,
+    )
     if not child:
         return "", f"child verification pending: {why}"
     if child["session_id"] == parent["session_id"]:
@@ -1576,7 +1592,13 @@ def fork_right_locked(pane_id: str) -> int:
 
     done = herdr_run(
         "pane", "split", "--pane", pane_id, "--direction", "right",
-        "--cwd", parent["cwd"], "--no-focus", timeout=10,
+        "--cwd", parent["cwd"],
+        # A pane started from inside Codex inherits the parent's process
+        # identity. The child reporter deliberately rejects a different
+        # session while CODEX_THREAD_ID still names the parent, so clear both
+        # identity variables before `codex fork` creates the child.
+        "--env", "CODEX_THREAD_ID=", "--env", "CODEX_SESSION_ID=",
+        "--no-focus", timeout=10,
     )
     if done is None or done.returncode != 0:
         why = command_failure(done, "herdr pane split could not be run")

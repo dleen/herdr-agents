@@ -1,6 +1,6 @@
 id = "dleen.herdr-agents"
 name = "Agent picker"
-version = "0.3.0"
+version = "0.3.1"
 min_herdr_version = "0.8.0"
 description = "An agent picker plus an owner-safe action that forks local Codex sessions into a right split."
 platforms = ["linux", "macos"]
